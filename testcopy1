@@ -1,0 +1,46 @@
+echo "Test object for HCP transfer" > test.txt
+OBJECT='test_object.txt'
+
+TOKEN='xxx'
+TENANT='xxx'
+DOMAIN='xxx'
+SRC_NODE='hcp1'
+DST_NODE='hcp2'
+NAMESPACE='xxx'
+OBJECT='test_object.txt'
+
+
+
+curl -sk -X PUT \
+  -H "Authorization: HCP ${TOKEN}" \
+  -H "Content-Type: text/plain" \
+  --data-binary @test.txt \
+  "https://${NAMESPACE}.${TENANT}.${SRC_NODE}.${DOMAIN}/rest/${OBJECT}"
+
+HTTP/1.1 201 Created
+
+curl -sk -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: HCP ${TOKEN}" \
+  "https://${NAMESPACE}.${TENANT}.${SRC_NODE}.${DOMAIN}/rest/${OBJECT}"
+
+curl -sk -H "Authorization: HCP ${TOKEN}" \
+  "https://${NAMESPACE}.${TENANT}.${SRC_NODE}.${DOMAIN}/rest/${OBJECT}" \
+| curl -sk -X PUT -H "Authorization: HCP ${TOKEN}" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @- \
+  "https://${NAMESPACE}.${TENANT}.${DST_NODE}.${DOMAIN}/rest/${OBJECT}"
+
+
+curl -sk -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: HCP ${TOKEN}" \
+  "https://${NAMESPACE}.${TENANT}.${DST_NODE}.${DOMAIN}/rest/${OBJECT}"
+
+
+
+curl -sk -X DELETE \
+  -H "Authorization: HCP ${TOKEN}" \
+  "https://${NAMESPACE}.${TENANT}.${SRC_NODE}.${DOMAIN}/rest/${OBJECT}"
+
+curl -sk -X DELETE \
+  -H "Authorization: HCP ${TOKEN}" \
+  "https://${NAMESPACE}.${TENANT}.${DST_NODE}.${DOMAIN}/rest/${OBJECT}"
