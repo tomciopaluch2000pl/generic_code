@@ -1,0 +1,230 @@
+#!/bin/bash
+# =============================================================================
+#  Script:      hcp_copy_to_node.sh
+#  Purpose:     Copy HCP objects (containers) from any available source node
+#               to a chosen target node, WITHOUT overwriting existing objects.
+#
+#  Input lines in list files MUST be:  <namespace>/<object-path>
+#    Example: my-ns/abcd-1234-L/000000000000abcd.ccf
+#
+#  What it does:
+#   - Builds a de-duplicated union of objects from provided per-node lists
+#   - For each object:
+#       1) Checks destination: if object exists -> SKIP (no overwrite)
+#       2) Finds first source node where the object exists
+#       3) Stream-copies: GET (source) | PUT (destination)
+#       4) Verifies presence on destination
+#   - Writes comprehensive logs and machine-readable summaries
+#
+#  Safety:
+#   - No deletion is performed
+#   - No overwrite is performed
+#
+#  Usage:
+#    ./hcp_copy_to_node.sh \
+#      --lists "path/to/hcp1.txt path/to/hcp2.txt ..." \
+#      --target hcp4 \
+#      --nodes  "hcp1 hcp2 hcp3 hcp4" \
+#      --tenant <tenant> \
+#      --domain <domain> \
+#      --token  '<token>' \
+#      [--retries 2] [--limit N] [--debug] [--dry-run]
+#
+#  Outputs (output/<timestamp>_copy_to_<target>/):
+#    - copy_summary.tsv           : path | source_node | target_node | result | info
+#    - copied.txt                 : successfully copied objects
+#    - skipped_exists.txt         : already present on destination (not overwritten)
+#    - not_found_on_any_source.txt: missing on all source nodes
+#    - failed.txt                 : attempted but not present after copy attempts
+#    - would_copy.txt             : (dry-run) objects that would be copied
+#    - copy.log                   : verbose audit log (URLs, codes, decisions)
+#    - objects_union.txt          : unique, de-duplicated worklist used by the run
+#
+#  Notes:
+#   - Token is the raw HCP token (do NOT prefix with "Authorization: HCP ")
+#   - Uses HTTPS with -k (insecure) to tolerate self-signed certs; adjust if needed
+# =============================================================================
+
+set -euo pipefail
+
+# ------------------------------- Args ----------------------------------------
+LISTS=""        # space-separated files with object paths (e.g., "hcp1.txt hcp2.txt ...")
+TARGET=""       # target node alias, e.g., hcp4
+NODES=""        # space-separated nodes, probe order for sources (e.g., "hcp1 hcp2 hcp3 hcp4")
+TENANT=""; DOMAIN=""; TOKEN=""
+DEBUG=0; DRYRUN=0; RETRIES=2; LIMIT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lists)   LISTS="$2"; shift 2 ;;
+    --target)  TARGET="$2"; shift 2 ;;
+    --nodes)   NODES="$2";  shift 2 ;;
+    --tenant)  TENANT="$2"; shift 2 ;;
+    --domain)  DOMAIN="$2"; shift 2 ;;
+    --token)   TOKEN="$2";  shift 2 ;;
+    --retries) RETRIES="$2"; shift 2 ;;
+    --limit)   LIMIT="$2";   shift 2 ;;
+    --debug)   DEBUG=1; shift ;;
+    --dry-run) DRYRUN=1; shift ;;
+    -h|--help)
+      cat <<EOF
+Usage:
+  $0 --lists "hcp1.txt hcp2.txt ..." --target hcpX --nodes "hcp1 hcp2 ..." \\
+     --tenant TENANT --domain DOMAIN --token TOKEN [--retries N] [--limit N] [--debug] [--dry-run]
+EOF
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Required args
+[[ -n "${LISTS}" && -n "${TARGET}" && -n "${NODES}" && -n "${TENANT}" && -n "${DOMAIN}" && -n "${TOKEN}" ]] \
+  || { echo "ERROR: required args missing" >&2; exit 1; }
+
+# Validate list files
+for f in $LISTS; do
+  [[ -f "$f" ]] || { echo "ERROR: list file not found: $f" >&2; exit 1; }
+done
+
+# ----------------------------- Output layout ---------------------------------
+STAMP="$(date +%Y%m%d_%H%M%S)"
+OUTDIR="output/${STAMP}_copy_to_${TARGET}"
+mkdir -p "${OUTDIR}"
+
+LOG="${OUTDIR}/copy.log"
+TSV="${OUTDIR}/copy_summary.tsv"
+UNION="${OUTDIR}/objects_union.txt"
+
+COPIED="${OUTDIR}/copied.txt"
+SKIPPED_EXISTS="${OUTDIR}/skipped_exists.txt"
+NOT_FOUND_SRC="${OUTDIR}/not_found_on_any_source.txt"
+FAILED="${OUTDIR}/failed.txt"
+WOULD_COPY="${OUTDIR}/would_copy.txt"   # dry-run only
+
+: > "${LOG}"; : > "${TSV}"; : > "${UNION}"
+: > "${COPIED}"; : > "${SKIPPED_EXISTS}"; : > "${NOT_FOUND_SRC}"; : > "${FAILED}"; : > "${WOULD_COPY}"
+echo -e "path\tsource_node\ttarget_node\tresult\tinfo" > "${TSV}"
+
+# ------------------------------- Helpers -------------------------------------
+clean_line() { echo "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+http_code() {
+  local url="$1"
+  curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: HCP ${TOKEN}" "${url}" || echo "000"
+}
+
+exists_on_node() {
+  local url="$1" code
+  code="$(http_code "$url")"
+  [[ "$code" =~ ^(200|204|206)$ ]]
+}
+
+copy_stream() {
+  # Stream: GET (source) | PUT (destination); return PUT code
+  local src_url="$1" dst_url="$2"
+  curl -sk -H "Authorization: HCP ${TOKEN}" "${src_url}" \
+  | curl -sk -X PUT \
+      -H "Authorization: HCP ${TOKEN}" \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary @- -o /dev/null -w '%{http_code}' "${dst_url}" || echo "000"
+}
+
+log() { printf "[%s] %s\n" "$(date '+%F %T')" "$*" >> "${LOG}"; }
+
+# ------------------------------ Build UNION ----------------------------------
+# Merge all objects from provided lists, normalize, remove duplicates.
+for f in $LISTS; do awk 'NF' "$f"; done \
+ | sed -e 's/\r$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+ | awk '!seen[$0]++' > "${UNION}"
+
+TOTAL="$(wc -l < "${UNION}" | tr -d ' ')"
+log "Union built: ${TOTAL} unique objects"
+(( DEBUG )) && { echo "Lists: ${LISTS}" >> "${LOG}"; echo "Target: ${TARGET}" >> "${LOG}"; }
+
+# ------------------------------- Main loop -----------------------------------
+i=0
+while IFS= read -r raw || [[ -n "$raw" ]]; do
+  LINE="$(clean_line "$raw")"
+  [[ -z "${LINE}" ]] && continue
+  (( i++ ))
+  (( LIMIT > 0 && i > LIMIT )) && { log "Limit ${LIMIT} reached. Stopping."; break; }
+
+  # Parse namespace and object key from line
+  NS="${LINE%%/*}"
+  KEY="${LINE#*/}"
+
+  # Destination URL and existence check (NO OVERWRITE)
+  DST_URL="https://${NS}.${TENANT}.${TARGET}.${DOMAIN}/rest/${KEY}"
+
+  if exists_on_node "${DST_URL}"; then
+    echo "${LINE}" >> "${SKIPPED_EXISTS}"
+    echo -e "${LINE}\t-\t${TARGET}\tskip-exists\t200" >> "${TSV}"
+    log "SKIP (already exists on ${TARGET}): ${LINE}"
+    continue
+  fi
+
+  # Find first source node that has the object
+  SRC_NODE=""; SRC_URL=""
+  for n in ${NODES}; do
+    [[ "${n}" == "${TARGET}" ]] && continue
+    url="https://${NS}.${TENANT}.${n}.${DOMAIN}/rest/${KEY}"
+    if exists_on_node "${url}"; then
+      SRC_NODE="${n}"; SRC_URL="${url}"
+      break
+    fi
+  done
+
+  if [[ -z "${SRC_NODE}" ]]; then
+    echo "${LINE}" >> "${NOT_FOUND_SRC}"
+    echo -e "${LINE}\t-\t${TARGET}\tno-source\t404" >> "${TSV}"
+    log "NO-SOURCE (not found on any source node): ${LINE}"
+    continue
+  fi
+
+  # Dry-run: record plan only
+  if (( DRYRUN )); then
+    echo "${LINE}" >> "${WOULD_COPY}"
+    echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tdry-run\twould-copy" >> "${TSV}"
+    log "DRY-RUN would copy: ${SRC_NODE} -> ${TARGET} | ${LINE}"
+    continue
+  fi
+
+  # Real copy with simple retries for transient issues
+  attempt=0; put_code="000"
+  while (( attempt <= RETRIES )); do
+    (( attempt++ ))
+    log "COPY attempt ${attempt}: ${SRC_NODE} -> ${TARGET} | ${LINE}"
+    put_code="$(copy_stream "${SRC_URL}" "${DST_URL}")"
+
+    if [[ "${put_code}" == "201" || "${put_code}" == "200" ]]; then
+      # Verify after PUT
+      if exists_on_node "${DST_URL}"; then
+        echo "${LINE}" >> "${COPIED}"
+        echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tok\t${put_code}" >> "${TSV}"
+        log "OK (${put_code}) ${LINE}"
+        break
+      fi
+    fi
+
+    log "RETRY (${put_code}) ${LINE}"
+    sleep 1
+  done
+
+  # If still not on destination, mark as failed
+  if ! exists_on_node "${DST_URL}"; then
+    echo "${LINE}" >> "${FAILED}"
+    echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tfail\t${put_code}" >> "${TSV}"
+    log "FAILED (${put_code}) ${LINE}"
+  fi
+done < "${UNION}"
+
+# ------------------------------- Summary -------------------------------------
+echo "Output: ${OUTDIR}"
+echo "  union file            : ${UNION}"
+echo "  summary (TSV)         : ${TSV}"
+echo "  copied                : ${COPIED}                  ($(wc -l < "${COPIED}" 2>/dev/null || echo 0))"
+echo "  skipped (exists)      : ${SKIPPED_EXISTS}          ($(wc -l < "${SKIPPED_EXISTS}" 2>/dev/null || echo 0))"
+echo "  no source found       : ${NOT_FOUND_SRC}           ($(wc -l < "${NOT_FOUND_SRC}" 2>/dev/null || echo 0))"
+echo "  failed                : ${FAILED}                  ($(wc -l < "${FAILED}" 2>/dev/null || echo 0))"
+(( DRYRUN )) && echo "  would copy (dry-run)  : ${WOULD_COPY}              ($(wc -l < "${WOULD_COPY}" 2>/dev/null || echo 0))"
+echo "  detailed log          : ${LOG}"
