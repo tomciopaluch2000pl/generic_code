@@ -1,0 +1,255 @@
+#!/bin/bash
+# =============================================================================
+#  Script:      hcp_copy_to_node.sh
+#  Purpose:     Copy HCP objects between nodes WITHOUT overwrite. Supports DRY-RUN.
+#  Input line:  <namespace>/<object-path>
+# =============================================================================
+
+set -euo pipefail
+
+LISTS=""; TARGET=""; NODES=""; TENANT=""; DOMAIN=""; TOKEN=""
+RETRIES=2; LIMIT=0; DEBUG=0; DRYRUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lists)   LISTS="$2"; shift 2 ;;
+    --target)  TARGET="$2"; shift 2 ;;
+    --nodes)   NODES="$2";  shift 2 ;;
+    --tenant)  TENANT="$2"; shift 2 ;;
+    --domain)  DOMAIN="$2"; shift 2 ;;
+    --token)   TOKEN="$2";  shift 2 ;;
+    --retries) RETRIES="$2"; shift 2 ;;
+    --limit)   LIMIT="$2";   shift 2 ;;
+    --debug)   DEBUG=1; shift ;;
+    --dry-run) DRYRUN=1; shift ;;
+    -h|--help)
+      echo "Usage: $0 --lists \"hcp1.txt ...\" --target hcpX --nodes \"hcp1 hcp2 ...\" --tenant T --domain D --token TOK [--retries N] [--limit N] [--debug] [--dry-run]"
+      exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+[[ -n "${LISTS}" && -n "${TARGET}" && -n "${NODES}" && -n "${TENANT}" && -n "${DOMAIN}" && -n "${TOKEN}" ]] \
+  || { echo "ERROR: required args missing" >&2; exit 1; }
+for f in $LISTS; do [[ -f "$f" ]] || { echo "ERROR: list file not found: $f" >&2; exit 1; }; done
+
+STAMP="$(date +%Y%m%d_%H%M%S)"
+OUTDIR="output/${STAMP}_copy_to_${TARGET}"
+mkdir -p "${OUTDIR}"
+
+LOG="${OUTDIR}/copy.log"
+TSV="${OUTDIR}/copy_summary.tsv"
+UNION="${OUTDIR}/objects_union.txt"
+
+COPIED="${OUTDIR}/copied.txt"
+SKIPPED_EXISTS="${OUTDIR}/skipped_exists.txt"
+NOT_FOUND_SRC="${OUTDIR}/not_found_on_any_source.txt"
+FAILED="${OUTDIR}/failed.txt"
+WOULD_COPY="${OUTDIR}/would_copy.txt"
+
+: > "${LOG}"; : > "${TSV}"; : > "${UNION}"
+: > "${COPIED}"; : > "${SKIPPED_EXISTS}"; : > "${NOT_FOUND_SRC}"; : > "${FAILED}"; : > "${WOULD_COPY}"
+echo -e "path\tsource_node\ttarget_node\tresult\tinfo" > "${TSV}"
+
+clean_line() { echo "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+log()        { printf "[%s] %s\n" "$(date '+%F %T')" "$*" >> "${LOG}"; }
+
+http_code() {
+  local url="$1"
+  curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: HCP ${TOKEN}" "${url}" || echo "000"
+}
+exists_on_node() {
+  local url="$1" code
+  code="$(http_code "$url")"
+  [[ "$code" =~ ^(200|204|206)$ ]]
+}
+copy_stream() {
+  local src_url="$1" dst_url="$2"
+  curl -sk -H "Authorization: HCP ${TOKEN}" "${src_url}" \
+  | curl -sk -X PUT -H "Authorization: HCP ${TOKEN}" \
+         -H "Content-Type: application/octet-stream" \
+         --data-binary @- -o /dev/null -w '%{http_code}' "${dst_url}" || echo "000"
+}
+
+# ---------- Build UNION (extra logs) ----------
+for f in $LISTS; do awk 'NF' "$f"; done \
+ | sed -e 's/\r$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+ | awk '!seen[$0]++' > "${UNION}"
+
+TOTAL="$(wc -l < "${UNION}" | tr -d ' ')"
+FIRST="$(head -n1 "${UNION}" || true)"
+log "Lists: ${LISTS}"
+log "Target: ${TARGET}"
+log "Union built: ${TOTAL} unique objects"
+log "Union first line: ${FIRST}"
+
+# If debug, trace the loop to LOG
+if (( DEBUG )); then
+  {
+    echo "=== DEBUG TRACE START ==="
+    set -x
+    i=0
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+      LINE="$(clean_line "$raw")"
+      [[ -z "${LINE}" ]] && continue
+      (( i++ ))
+      if (( LIMIT > 0 && i > LIMIT )); then
+        log "Limit ${LIMIT} reached. Stopping."
+        break
+      fi
+
+      log "PROCESS: ${LINE}"
+
+      NS="${LINE%%/*}"
+      KEY="${LINE#*/}"
+
+      # Log parsed pieces explicitly
+      log "PARSED NS=[${NS}] KEY=[${KEY}]"
+
+      DST_URL="https://${NS}.${TENANT}.${TARGET}.${DOMAIN}/rest/${KEY}"
+      dst_code="$(http_code "${DST_URL}")"
+      log "CHECK DST: ${TARGET} code=${dst_code} url=${DST_URL}"
+
+      if [[ "${dst_code}" =~ ^(200|204|206)$ ]]; then
+        echo "${LINE}" >> "${SKIPPED_EXISTS}"
+        echo -e "${LINE}\t-\t${TARGET}\tskip-exists\t${dst_code}" >> "${TSV}"
+        log "SKIP: already exists on ${TARGET}"
+        continue
+      fi
+
+      SRC_NODE=""; SRC_URL=""
+      for n in ${NODES}; do
+        [[ "${n}" == "${TARGET}" ]] && continue
+        url="https://${NS}.${TENANT}.${n}.${DOMAIN}/rest/${KEY}"
+        src_code="$(http_code "${url}")"
+        log "CHECK SRC: ${n} code=${src_code} url=${url}"
+        if [[ "${src_code}" =~ ^(200|204|206)$ ]]; then
+          SRC_NODE="${n}"; SRC_URL="${url}"
+          break
+        fi
+      done
+
+      if [[ -z "${SRC_NODE}" ]]; then
+        echo "${LINE}" >> "${NOT_FOUND_SRC}"
+        echo -e "${LINE}\t-\t${TARGET}\tno-source\t404" >> "${TSV}"
+        log "NO-SOURCE: not found on any source node"
+        continue
+      fi
+
+      if (( DRYRUN )); then
+        echo "${LINE}" >> "${WOULD_COPY}"
+        echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tdry-run\twould-copy" >> "${TSV}"
+        log "DRY-RUN would copy: ${SRC_NODE} -> ${TARGET}"
+        continue
+      fi
+
+      attempt=0; put_code="000"
+      while (( attempt <= RETRIES )); do
+        (( attempt++ ))
+        log "COPY attempt ${attempt}: ${SRC_NODE} -> ${TARGET}"
+        put_code="$(copy_stream "${SRC_URL}" "${DST_URL}")"
+        if [[ "${put_code}" == "201" || "${put_code}" == "200" ]]; then
+          if exists_on_node "${DST_URL}"; then
+            echo "${LINE}" >> "${COPIED}"
+            echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tok\t${put_code}" >> "${TSV}"
+            log "OK (${put_code})"
+            break
+          fi
+        fi
+        log "RETRY NEEDED (last PUT code=${put_code})"
+        sleep 1
+      done
+
+      if ! exists_on_node "${DST_URL}"; then
+        echo "${LINE}" >> "${FAILED}"
+        echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tfail\t${put_code}" >> "${TSV}"
+        log "FAILED (final PUT code=${put_code})"
+      fi
+    done < "${UNION}"
+    set +x
+    echo "=== DEBUG TRACE END ==="
+  } >> "${LOG}" 2>&1
+else
+  i=0
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    LINE="$(clean_line "$raw")"
+    [[ -z "${LINE}" ]] && continue
+    (( i++ ))
+    (( LIMIT > 0 && i > LIMIT )) && { log "Limit ${LIMIT} reached. Stopping."; break; }
+
+    log "PROCESS: ${LINE}"
+
+    NS="${LINE%%/*}"
+    KEY="${LINE#*/}"
+
+    DST_URL="https://${NS}.${TENANT}.${TARGET}.${DOMAIN}/rest/${KEY}"
+    dst_code="$(http_code "${DST_URL}")"
+    log "CHECK DST: ${TARGET} code=${dst_code} url=${DST_URL}"
+
+    if [[ "${dst_code}" =~ ^(200|204|206)$ ]]; then
+      echo "${LINE}" >> "${SKIPPED_EXISTS}"
+      echo -e "${LINE}\t-\t${TARGET}\tskip-exists\t${dst_code}" >> "${TSV}"
+      log "SKIP: already exists on ${TARGET}"
+      continue
+    fi
+
+    SRC_NODE=""; SRC_URL=""
+    for n in ${NODES}; do
+      [[ "${n}" == "${TARGET}" ]] && continue
+      url="https://${NS}.${TENANT}.${n}.${DOMAIN}/rest/${KEY}"
+      src_code="$(http_code "${url}")"
+      log "CHECK SRC: ${n} code=${src_code} url=${url}"
+      if [[ "${src_code}" =~ ^(200|204|206)$ ]]; then
+        SRC_NODE="${n}"; SRC_URL="${url}"
+        break
+      fi
+    done
+
+    if [[ -z "${SRC_NODE}" ]]; then
+      echo "${LINE}" >> "${NOT_FOUND_SRC}"
+      echo -e "${LINE}\t-\t${TARGET}\tno-source\t404" >> "${TSV}"
+      log "NO-SOURCE: not found on any source node"
+      continue
+    fi
+
+    if (( DRYRUN )); then
+      echo "${LINE}" >> "${WOULD_COPY}"
+      echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tdry-run\twould-copy" >> "${TSV}"
+      log "DRY-RUN would copy: ${SRC_NODE} -> ${TARGET}"
+      continue
+    fi
+
+    attempt=0; put_code="000"
+    while (( attempt <= RETRIES )); do
+      (( attempt++ ))
+      log "COPY attempt ${attempt}: ${SRC_NODE} -> ${TARGET}"
+      put_code="$(copy_stream "${SRC_URL}" "${DST_URL}")"
+      if [[ "${put_code}" == "201" || "${put_code}" == "200" ]]; then
+        if exists_on_node "${DST_URL}"; then
+          echo "${LINE}" >> "${COPIED}"
+          echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tok\t${put_code}" >> "${TSV}"
+          log "OK (${put_code})"
+          break
+        fi
+      fi
+      log "RETRY NEEDED (last PUT code=${put_code})"
+      sleep 1
+    done
+
+    if ! exists_on_node "${DST_URL}"; then
+      echo "${LINE}" >> "${FAILED}"
+      echo -e "${LINE}\t${SRC_NODE}\t${TARGET}\tfail\t${put_code}" >> "${TSV}"
+      log "FAILED (final PUT code=${put_code})"
+    fi
+  done < "${UNION}"
+fi
+
+echo "Output: ${OUTDIR}"
+echo "  union file            : ${UNION}"
+echo "  summary (TSV)         : ${TSV}"
+echo "  copied                : ${COPIED}                  ($(wc -l < "${COPIED}" 2>/dev/null || echo 0))"
+echo "  skipped (exists)      : ${SKIPPED_EXISTS}          ($(wc -l < "${SKIPPED_EXISTS}" 2>/dev/null || echo 0))"
+echo "  no source found       : ${NOT_FOUND_SRC}           ($(wc -l < "${NOT_FOUND_SRC}" 2>/dev/null || echo 0))"
+echo "  failed                : ${FAILED}                  ($(wc -l < "${FAILED}" 2>/dev/null || echo 0))"
+(( DRYRUN )) && echo "  would copy (dry-run)  : ${WOULD_COPY}              ($(wc -l < "${WOULD_COPY}" 2>/dev/null || echo 0))"
+echo "  detailed log          : ${LOG}"
