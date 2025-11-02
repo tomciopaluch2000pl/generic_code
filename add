@@ -1,0 +1,40 @@
+while IFS= read -r raw || [[ -n "$raw" ]]; do
+  LINE="$(clean_line "$raw")"
+  [[ -z "${LINE}" ]] && continue
+
+  # NEW: log każdej przetwarzanej linii
+  log "PROCESS: ${LINE}"
+
+  # Parse namespace and object key from line
+  NS="${LINE%%/*}"
+  KEY="${LINE#*/}"
+
+  # Destination URL and existence check (NO OVERWRITE)
+  DST_URL="https://${NS}.${TENANT}.${TARGET}.${DOMAIN}/rest/${KEY}"
+
+  # NEW: zbierz i zaloguj kod celu (przed if-em)
+  dst_code="$(http_code "${DST_URL}")"
+  log "CHECK DST: ${TARGET} code=${dst_code} url=${DST_URL}"
+
+  if [[ "${dst_code}" =~ ^(200|204|206)$ ]]; then
+    echo "${LINE}" >> "${SKIPPED_EXISTS}"
+    echo -e "${LINE}\t-\t${TARGET}\tskip-exists\t${dst_code}" >> "${TSV}"
+    log "SKIP: already exists on ${TARGET}"
+    continue
+  fi
+
+  # Find first source node that has the object
+  SRC_NODE=""; SRC_URL=""
+  for n in ${NODES}; do
+    [[ "${n}" == "${TARGET}" ]] && continue
+    url="https://${NS}.${TENANT}.${n}.${DOMAIN}/rest/${KEY}"
+
+    # NEW: log kod źródła dla każdego noda
+    src_code="$(http_code "${url}")"
+    log "CHECK SRC: ${n} code=${src_code} url=${url}"
+
+    if [[ "${src_code}" =~ ^(200|204|206)$ ]]; then
+      SRC_NODE="${n}"; SRC_URL="${url}"
+      break
+    fi
+  done
