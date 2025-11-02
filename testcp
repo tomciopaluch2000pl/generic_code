@@ -1,0 +1,17 @@
+TOKEN='…' ; TENANT='xxx' ; DOMAIN='xxx'
+NODE_SRC='hcp4'          # z hcp4.txt
+NODE_DST='hcp3'          # Twój target
+LINE='xxx'
+
+NS="${LINE%%/*}"
+KEY="${LINE#*/}"
+
+echo "DEST check (hcp3):"
+curl -sk -o /dev/null -w 'hcp3 -> HTTP %{http_code}\n' \
+  -H "Authorization: HCP ${TOKEN}" \
+  "https://${NS}.${TENANT}.${NODE_DST}.${DOMAIN}/rest/${KEY}"
+
+echo "SOURCE check (hcp4):"
+curl -sk -o /dev/null -w 'hcp4 -> HTTP %{http_code}\n' \
+  -H "Authorization: HCP ${TOKEN}" \
+  "https://${NS}.${TENANT}.${NODE_SRC}.${DOMAIN}/rest/${KEY}"
