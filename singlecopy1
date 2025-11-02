@@ -1,0 +1,177 @@
+#!/bin/bash
+# =============================================================================
+#  Script:      hcp_copy_object.sh
+#  Purpose:     Copy a single HCP object from one node to another WITHOUT
+#               overwriting existing data. Works for binary data (streamed).
+#
+#  Object path format (argument --object):
+#       <namespace>/<object-path-without-namespace>
+#
+#  Effective URL layout used by the script:
+#       https://<namespace>.<tenant>.<node>.<domain>/rest/<object-path>
+#
+#  Safety:
+#    - No DELETE is ever executed
+#    - Destination is checked first; if exists, copy is skipped
+#    - After PUT, presence on destination is verified
+# =============================================================================
+set -euo pipefail
+
+# ------------------------------- Defaults ------------------------------------
+RETRIES=2          # number of PUT retries on failure
+INSECURE=0         # add -k to curl if set to 1
+DEBUG=0            # more verbose log
+DRYRUN=0
+
+# ------------------------------- Args ----------------------------------------
+NAMESPACE=""; TENANT=""; DOMAIN=""
+SRC_NODE=""; DST_NODE=""
+OBJECT=""      # <namespace>/<object-path-without-namespace>
+TOKEN=""
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 --object "namespace/key/without/namespace.ext" \\
+     --tenant TENANT --domain DOMAIN \\
+     --src-node hcpX --dst-node hcpY \\
+     --token 'TOKEN' [--retries N] [--insecure] [--debug] [--dry-run]
+
+Notes:
+  * This script never overwrites existing data on destination.
+  * Works for binary objects (streams GET -> PUT).
+  * TOKEN is the HCP auth token value (without the "Authorization: HCP " prefix).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --object)   OBJECT="$2"; shift 2 ;;
+    --tenant)   TENANT="$2"; shift 2 ;;
+    --domain)   DOMAIN="$2"; shift 2 ;;
+    --src-node) SRC_NODE="$2"; shift 2 ;;
+    --dst-node) DST_NODE="$2"; shift 2 ;;
+    --token)    TOKEN="$2"; shift 2 ;;
+    --retries)  RETRIES="${2}"; shift 2 ;;
+    --insecure) INSECURE=1; shift ;;
+    --debug)    DEBUG=1; shift ;;
+    --dry-run)  DRYRUN=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+# ----------------------------- Validation ------------------------------------
+[[ -n "$OBJECT" && -n "$TENANT" && -n "$DOMAIN" && -n "$SRC_NODE" && -n "$DST_NODE" && -n "$TOKEN" ]] || {
+  echo "ERROR: missing required args" >&2; usage; exit 1;
+}
+
+# Split "<namespace>/<key>"
+NAMESPACE="${OBJECT%%/*}"
+KEY="${OBJECT#*/}"
+[[ "$NAMESPACE" != "$KEY" ]] || { echo "ERROR: --object must be 'namespace/path/...'"; exit 1; }
+
+# ------------------------------ Output / Logs --------------------------------
+STAMP="$(date +%Y%m%d_%H%M%S)"
+OUTDIR="output/${STAMP}_single_copy"
+mkdir -p "$OUTDIR"
+LOG="${OUTDIR}/copy.log"
+SUMMARY="${OUTDIR}/summary.tsv"
+: > "$LOG"
+echo -e "object\tsrc_node\tdst_node\tresult\tinfo" > "$SUMMARY"
+
+log() { printf "[%s] %s\n" "$(date '+%F %T')" "$*" | tee -a "$LOG" >/dev/null; }
+
+# ------------------------------ Curl helpers ---------------------------------
+CURL_OPTS=(-sS -L --fail-early)
+(( INSECURE )) && CURL_OPTS+=(-k)
+
+hdr_auth=(-H "Authorization: HCP ${TOKEN}")
+
+http_code() {
+  local url="$1"
+  curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' "${hdr_auth[@]}" "$url" || echo "000"
+}
+
+exists_on() {
+  local node="$1"
+  local url="https://${NAMESPACE}.${TENANT}.${node}.${DOMAIN}/rest/${KEY}"
+  local code
+  code="$(http_code "$url")"
+  [[ "$code" =~ ^(200|204|206)$ ]]
+}
+
+copy_stream() {
+  # GET from source -> PUT to destination, binary safe (no temp file)
+  local src_node="$1" dst_node="$2"
+  local src="https://${NAMESPACE}.${TENANT}.${src_node}.${DOMAIN}/rest/${KEY}"
+  local dst="https://${NAMESPACE}.${TENANT}.${dst_node}.${DOMAIN}/rest/${KEY}"
+
+  curl "${CURL_OPTS[@]}" "${hdr_auth[@]}" "$src" \
+  | curl "${CURL_OPTS[@]}" -X PUT \
+        "${hdr_auth[@]}" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary @- \
+        -o /dev/null -w '%{http_code}' \
+        "$dst" || echo "000"
+}
+
+# ------------------------------ Main routine ---------------------------------
+log "INPUT object     : ${OBJECT}"
+log "PARSED namespace : ${NAMESPACE}"
+log "PARSED key       : ${KEY}"
+log "SRC node         : ${SRC_NODE}"
+log "DST node         : ${DST_NODE}"
+log "Tenant/Domain    : ${TENANT}.${DOMAIN}"
+(( DRYRUN )) && log "MODE             : DRY-RUN"
+
+# 1) Skip if already on destination
+if exists_on "$DST_NODE"; then
+  log "DESTINATION check: present on ${DST_NODE} -> SKIP"
+  echo -e "${OBJECT}\t${SRC_NODE}\t${DST_NODE}\tskip-exists\t-" >> "$SUMMARY"
+  echo "Output: $OUTDIR"
+  exit 0
+fi
+
+# 2) Ensure it exists on source
+if ! exists_on "$SRC_NODE"; then
+  log "SOURCE check: NOT present on ${SRC_NODE} -> ABORT"
+  echo -e "${OBJECT}\t${SRC_NODE}\t${DST_NODE}\tno-source\t-" >> "$SUMMARY"
+  echo "Output: $OUTDIR"
+  exit 2
+fi
+
+# 3) Dry-run?
+if (( DRYRUN )); then
+  log "DRY-RUN: would copy from ${SRC_NODE} -> ${DST_NODE}"
+  echo -e "${OBJECT}\t${SRC_NODE}\t${DST_NODE}\tdry-run\twould-copy" >> "$SUMMARY"
+  echo "Output: $OUTDIR"
+  exit 0
+fi
+
+# 4) Copy with retries
+attempt=0; put_code="000"
+while (( attempt <= RETRIES )); do
+  (( attempt++ ))
+  log "COPY attempt ${attempt}: ${SRC_NODE} -> ${DST_NODE}"
+  put_code="$(copy_stream "$SRC_NODE" "$DST_NODE")"
+  log "PUT returned HTTP: ${put_code}"
+
+  if [[ "$put_code" == "201" || "$put_code" == "200" ]]; then
+    if exists_on "$DST_NODE"; then
+      log "VERIFY: present on ${DST_NODE} -> OK"
+      echo -e "${OBJECT}\t${SRC_NODE}\t${DST_NODE}\tok\t${put_code}" >> "$SUMMARY"
+      echo "Output: $OUTDIR"
+      exit 0
+    fi
+    log "VERIFY: not visible yet on ${DST_NODE}, retrying..."
+  else
+    log "PUT not successful, retrying..."
+  fi
+  sleep 1
+done
+
+log "FAILED: object not present on ${DST_NODE} after retries (last PUT=${put_code})"
+echo -e "${OBJECT}\t${SRC_NODE}\t${DST_NODE}\tfail\t${put_code}" >> "$SUMMARY"
+echo "Output: $OUTDIR"
+exit 3
