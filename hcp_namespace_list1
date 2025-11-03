@@ -1,0 +1,223 @@
+#!/bin/bash
+# =============================================================================
+# Script:   hcp_list_namespace.sh
+# Purpose:  List all objects in a given HCP namespace across multiple nodes
+#           using the REST API, recursively, with pagination.
+#
+# Output:   output/<timestamp>_hcp_list/
+#             ├─ hcp1.lst, hcp2.lst, ...   # list of objects per node
+#             ├─ union_all.lst             # unique union across all nodes
+#             └─ list.log                  # activity log
+#
+# Notes:
+#   - Uses only curl, awk, and sed (no external XML parser required).
+#   - Pagination is handled via the HCP "marker" or "next" mechanism.
+#   - Safe: READ-ONLY (does not modify, upload, or delete anything).
+#   - Works for millions of objects (uses disk, not RAM, to store results).
+# =============================================================================
+set -euo pipefail
+
+# ------------------- PARAMETERS -------------------
+NAMESPACE=""
+TENANT=""
+DOMAIN=""
+TOKEN=""
+NODES=""          # e.g. "hcp1 hcp2 hcp3 hcp4"
+MAX=2000          # max results per REST page
+PREFIX=""         # optional prefix, e.g. "folder1/"
+INSECURE=0
+DEBUG=0
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 --namespace NS --tenant TENANT --domain DOMAIN --token 'TOKEN' \\
+     --nodes "hcp1 hcp2 hcp4 hcp3" [--max 2000] [--prefix 'folder1/'] [--insecure] [--debug]
+
+Examples:
+  # List full namespace across 4 nodes
+  $0 --namespace odlpgrel-prod-01 --tenant okg --domain hacl.ngas.ubs.net \\
+     --token '...' --nodes "hcp1 hcp2 hcp4 hcp3" --max 5000 --insecure
+
+  # List only a specific subfolder
+  $0 --namespace odlpgrel-prod-01 --tenant okg --domain hacl.ngas.ubs.net \\
+     --token '...' --nodes "hcp1 hcp2" --prefix 'folder1/' --max 4000
+EOF
+}
+
+# ------------------- ARGUMENT PARSING -------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --namespace) NAMESPACE="$2"; shift 2 ;;
+    --tenant)    TENANT="$2"; shift 2 ;;
+    --domain)    DOMAIN="$2"; shift 2 ;;
+    --token)     TOKEN="$2"; shift 2 ;;
+    --nodes)     NODES="$2"; shift 2 ;;
+    --max)       MAX="$2"; shift 2 ;;
+    --prefix)    PREFIX="$2"; shift 2 ;;
+    --insecure)  INSECURE=1; shift ;;
+    --debug)     DEBUG=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+# Check for required parameters
+[[ -n "$NAMESPACE" && -n "$TENANT" && -n "$DOMAIN" && -n "$TOKEN" && -n "$NODES" ]] \
+  || { echo "ERROR: missing required arguments"; usage; exit 1; }
+
+# ------------------- OUTPUT SETUP -------------------
+STAMP="$(date +%Y%m%d_%H%M%S)"
+OUTDIR="output/${STAMP}_hcp_list"
+mkdir -p "$OUTDIR"
+LOG="${OUTDIR}/list.log"
+: > "$LOG"
+
+log(){ printf "[%s] %s\n" "$(date '+%F %T')" "$*" | tee -a "$LOG" >/dev/null; }
+
+# ------------------- HELPER FUNCTIONS -------------------
+# Minimal URL encoding (keeps / and -)
+urlencode() {
+  local s="$1" i ch out=""
+  for ((i=0; i<${#s}; i++)); do
+    ch="${s:i:1}"
+    case "$ch" in
+      [a-zA-Z0-9._~/-]) out+="$ch" ;;
+      ' ')              out+='%20' ;;
+      *)                printf -v out '%s%%%02X' "$out" "'$ch" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+CURL_OPTS=(-sS -L)
+(( INSECURE )) && CURL_OPTS+=(-k)
+AUTH=(-H "Authorization: HCP ${TOKEN}")
+
+# Fetch a single directory page (XML response)
+fetch_dir_page() {
+  local node="$1" prefix="$2" marker="$3"
+  local enc_prefix enc_marker url
+  enc_prefix="$(urlencode "$prefix")"
+  url="https://${NAMESPACE}.${TENANT}.${node}.${DOMAIN}/rest/${enc_prefix}"
+  url="${url%/}/?type=directory&format=xml&max-results=${MAX}"
+  [[ -n "$marker" ]] && { enc_marker="$(urlencode "$marker")"; url="${url}&marker=${enc_marker}"; }
+  (( DEBUG )) && log "GET ${url}"
+  curl "${CURL_OPTS[@]}" "${AUTH[@]}" "$url"
+}
+
+# Parse XML page → FILE/DIR/MARKER lines
+parse_page() {
+  awk '
+    BEGIN{FS="[<>]"; inEntry=0; name=""; type=""}
+    /<entry>/ {inEntry=1; name=""; type=""}
+    /<\/entry>/{
+      if(inEntry && name!=""){
+        if(type=="directory"){print "DIR\t" name}
+        else{print "FILE\t" name}
+      }
+      inEntry=0; name=""; type="";
+    }
+    {
+      for(i=1;i<=NF;i++){
+        if($i=="name"){name=$(i+1)}
+        if($i=="type"){type=$(i+1)}
+        if($i=="nextMarker"){print "MARKER\t" $(i+1)}
+      }
+    }
+  ' \
+  && sed -n 's/.*rel="next".*marker=\([^"&]*\).*/MARKER\t\1/p'
+}
+
+# List all files and directories on one node
+list_node() {
+  local node="$1" outfile="$2"
+  : > "$outfile"
+  local queue="${OUTDIR}/.queue_${node}.txt"
+  local nextq="${OUTDIR}/.next_${node}.txt"
+  : > "$queue"; : > "$nextq"
+
+  # Start from root or prefix
+  if [[ -n "$PREFIX" ]]; then
+    echo "${PREFIX%/}/" >> "$queue"
+  else
+    echo "" >> "$queue"
+  fi
+
+  local total_files=0 total_dirs=0
+  log "[${node}] listing started (prefix='${PREFIX:-/}')"
+
+  # Breadth-first traversal
+  exec 3<"$queue"
+  while read -r prefix <&3; do
+    prefix="${prefix:-}"
+    local marker=""
+    while :; do
+      xml="$(fetch_dir_page "$node" "$prefix" "$marker" || true)"
+      [[ -z "$xml" ]] && break
+      mapfile -t lines < <(printf '%s\n' "$xml" | parse_page)
+
+      marker=""  # reset marker
+      for ln in "${lines[@]}"; do
+        kind="${ln%%$'\t'*}"
+        val="${ln#*$'\t'}"
+        case "$kind" in
+          FILE)
+            if [[ -n "$prefix" ]]; then
+              echo "${NAMESPACE}/${prefix}${val}" >> "$outfile"
+            else
+              echo "${NAMESPACE}/${val}" >> "$outfile"
+            fi
+            ((total_files++))
+            ;;
+          DIR)
+            if [[ -n "$prefix" ]]; then
+              echo "${prefix}${val%/}/" >> "$nextq"
+            else
+              echo "${val%/}/" >> "$nextq"
+            fi
+            ((total_dirs++))
+            ;;
+          MARKER)
+            marker="$val"
+            ;;
+        esac
+      done
+      [[ -z "$marker" ]] && break
+    done
+
+    # Handle next-level directories
+    if [[ $(wc -l < "$nextq") -gt 0 ]]; then
+      sort -u "$nextq" -o "$nextq"
+      exec 3<&-
+      mv "$nextq" "$queue"
+      : > "$nextq"
+      exec 3<"$queue"
+    fi
+  done
+
+  sort -u -o "$outfile" "$outfile"
+  log "[${node}] done: files=${total_files}, dirs=${total_dirs}, unique=$(wc -l < "$outfile")"
+  rm -f "$queue" "$nextq" || true
+}
+
+# ------------------- MAIN EXECUTION -------------------
+log "Namespace  : ${NAMESPACE}"
+log "Tenant     : ${TENANT}"
+log "Domain     : ${DOMAIN}"
+log "Nodes      : ${NODES}"
+log "Prefix     : ${PREFIX:-<root>}"
+log "Page size  : ${MAX}"
+
+declare -a outfiles=()
+for node in $NODES; do
+  of="${OUTDIR}/${node}.lst"
+  list_node "$node" "$of"
+  outfiles+=("$of")
+done
+
+cat "${outfiles[@]}" | sort -u > "${OUTDIR}/union_all.lst"
+log "Union across nodes: $(wc -l < "${OUTDIR}/union_all.lst")"
+
+echo "Output directory: ${OUTDIR}"
+ls -lh "${OUTDIR}"
