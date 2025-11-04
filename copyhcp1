@@ -1,0 +1,315 @@
+#!/usr/bin/bash
+# Purpose: Copy HCP objects listed in a TSV (path<TAB>nodes) from allowed source nodes to a single target node.
+# Behavior:
+#   - Skips if object already exists on target (HEAD=200)
+#   - Copies only if object exists on source (HEAD=200) and source is in --sources
+#   - Skips + reports multi-source cases (nodes with comma) – we do not auto-resolve them
+#   - Validates "nodes" column format (must be hcp1[,hcp2,...] without spaces); otherwise reports invalid
+#   - Dry-run: no download/upload; only checks + reports
+# Outputs:
+#   output/<TS>_copy_to_<target>/{copy.log,scan.log,copy_summary.tsv,*.txt}
+
+set -u
+
+# --- Absolute binaries (avoid PATH surprises) ---
+CURL="/usr/bin/curl"
+DATE="/usr/bin/date"
+MKDIR="/usr/bin/mkdir"
+BASENAME="/usr/bin/basename"
+GREP="/usr/bin/grep"
+AWK="/usr/bin/awk"
+SED="/usr/bin/sed"
+TR="/usr/bin/tr"
+HEAD="/usr/bin/head"
+TAIL="/usr/bin/tail"
+RM="/usr/bin/rm"
+PRINTF="/usr/bin/printf"
+
+# --- Defaults ---
+LIST=""
+TENANT=""
+DOMAIN=""
+TOKEN=""
+TARGET=""
+SOURCES=""
+INSECURE=0
+DRYRUN=0
+DEBUG=0
+RETRIES=1
+
+die() { echo "ERROR: $*" 1>&2; exit 1; }
+
+ts() { "${DATE}" '+%Y-%m-%d %H:%M:%S'; }
+
+http_head_code() {
+  # $1 = URL ; uses global TOKEN and INSECURE
+  local url="$1" code extra
+  extra="-sk"
+  [ "${INSECURE}" -eq 1 ] && extra="${extra} -k"
+  code=$(${CURL} ${extra} -o /dev/null -w '%{http_code}\n' -H "Authorization: HCP ${TOKEN}" "${url}" 2>/dev/null || echo "000")
+  echo "${code}"
+}
+
+download_object() {
+  # $1 = URL ; $2 = out file
+  local url="$1" out="$2" extra
+  extra="-sk"
+  [ "${INSECURE}" -eq 1 ] && extra="${extra} -k"
+  ${CURL} ${extra} -H "Authorization: HCP ${TOKEN}" "${url}" -o "${out}"
+  return $?
+}
+
+upload_object() {
+  # $1 = URL ; $2 = file
+  local url="$1" file="$2" extra
+  extra="-sk"
+  [ "${INSECURE}" -eq 1 ] && extra="${extra} -k"
+  ${CURL} ${extra} -X PUT -H "Authorization: HCP ${TOKEN}" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary @"${file}" "${url}"
+  return $?
+}
+
+# --- Parse CLI ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list)     LIST="${2:-}"; shift 2 ;;
+    --tenant)   TENANT="${2:-}"; shift 2 ;;
+    --domain)   DOMAIN="${2:-}"; shift 2 ;;
+    --token)    TOKEN="${2:-}"; shift 2 ;;
+    --target)   TARGET="${2:-}"; shift 2 ;;
+    --sources)  SOURCES="${2:-}"; shift 2 ;;   # e.g. "hcp1 hcp2 hcp4"
+    --retries)  RETRIES="${2:-1}"; shift 2 ;;
+    --insecure) INSECURE=1; shift ;;
+    --dry-run)  DRYRUN=1; shift ;;
+    --debug)    DEBUG=1; shift ;;
+    -h|--help)
+      cat <<EOF
+Usage:
+  $(basename "$0") --list <results_found.tsv> --tenant <tenant> --domain <domain> --token '<token>' \\
+                   --target <hcpX> --sources "hcp1 hcp2 hcp4" [--retries N] [--insecure] [--dry-run] [--debug]
+
+TSV format (tab-separated, header allowed):
+  path    nodes
+  namespace1/some/file.ccf    hcp1
+  namespace2/other/file.ccf   hcp1,hcp3
+EOF
+      exit 0
+      ;;
+    *) die "Unknown arg: $1" ;;
+  esac
+done
+
+[ -n "${LIST}" ]    || die "--list is required"
+[ -n "${TENANT}" ]  || die "--tenant is required"
+[ -n "${DOMAIN}" ]  || die "--domain is required"
+[ -n "${TOKEN}" ]   || die "--token is required"
+[ -n "${TARGET}" ]  || die "--target is required"
+[ -n "${SOURCES}" ] || die "--sources is required"
+
+# Normalize sources list to space-separated tokens (reject commas/spaces inside a token)
+ALLOW_SOURCES="${SOURCES}"
+
+# --- Output structure ---
+TS="$(${DATE} '+%Y%m%d_%H%M%S')"
+OUTDIR="output/${TS}_copy_to_${TARGET}"
+${MKDIR} -p "${OUTDIR}" || die "Cannot create ${OUTDIR}"
+
+LOG="${OUTDIR}/copy.log"
+SCAN="${OUTDIR}/scan.log"
+SUMMARY="${OUTDIR}/copy_summary.tsv"
+
+# Per-category files
+COPIED="${OUTDIR}/copied.txt"
+SKIP_EXISTS="${OUTDIR}/skipped_exists.txt"
+MULTI_SRC="${OUTDIR}/multi_source.txt"
+NOT_IN_SOURCES="${OUTDIR}/not_in_sources.txt"
+NOT_ON_SOURCE="${OUTDIR}/not_found_on_any_source.txt"
+INVALID_NODES="${OUTDIR}/invalid_nodes_format.txt"
+TSV_TARGET_LISTED_BUT_MISSING="${OUTDIR}/tsv_target_listed_but_missing.txt"
+FAILED="${OUTDIR}/failed.txt"
+WOULD_COPY="${OUTDIR}/would_copy.txt"
+
+# Fresh logs/headers
+echo "Output directory: ${OUTDIR}" > "${LOG}"
+echo "Tenant/Domain: ${TENANT} ${DOMAIN}" >> "${LOG}"
+echo "Target: ${TARGET}" >> "${LOG}"
+echo "Sources allowed: ${ALLOW_SOURCES}" >> "${LOG}"
+echo "Dry-run: ${DRYRUN}  Insecure: ${INSECURE}  Retries: ${RETRIES}" >> "${LOG}"
+echo "----" >> "${LOG}"
+
+echo "path\tsource_node\ttarget_node\tresult\tinfo" > "${SUMMARY}"
+: > "${SCAN}"
+: > "${COPIED}"
+: > "${SKIP_EXISTS}"
+: > "${MULTI_SRC}"
+: > "${NOT_IN_SOURCES}"
+: > "${NOT_ON_SOURCE}"
+: > "${INVALID_NODES}"
+: > "${TSV_TARGET_LISTED_BUT_MISSING}"
+: > "${FAILED}"
+: > "${WOULD_COPY}"
+
+log()  { echo "[$(ts)] $*"        >> "${LOG}"; [ "${DEBUG}" -eq 1 ] && echo "[$(ts)] $*"; }
+scan() { echo "[$(ts)] $*"        >> "${SCAN}"; [ "${DEBUG}" -eq 1 ] && echo "SCAN: $*"; }
+sum()  { echo -e "$*"             >> "${SUMMARY}"; }
+
+# --- Helpers ---
+ns_from_path() { echo "$1" | ${AWK} -F'/' '{print $1}'; }
+key_from_path() { echo "$1" | ${AWK} -F'/' '{first=$1; sub("^"first"/","",$0); print $0}'; }
+
+build_url() {
+  # $1 ns, $2 node, $3 key
+  echo "https://${1}.${TENANT}.${2}.${DOMAIN}/rest/${3}"
+}
+
+# Validate nodes column: only "hcp1" or "hcp1,hcp2,..." (no spaces).
+valid_nodes_format() {
+  echo "$1" | ${GREP} -E -q '^hcp[0-9](,hcp[0-9])*$'
+}
+
+# Is node in allowed sources list (space-separated)?
+node_allowed() {
+  local node="$1"
+  for s in ${ALLOW_SOURCES}; do
+    [ "$s" = "$node" ] && return 0
+  done
+  return 1
+}
+
+# --- Iterate TSV ---
+log "Reading list: ${LIST}"
+i=0
+
+# Skip header if present; read tab-separated
+# We accept both header and headerless files
+# shellcheck disable=SC2162
+while IFS=$'\t' read -r path nodes; do
+  # Skip empty lines
+  [ -z "${path:-}" ] && continue
+
+  # Skip header line (if first column is literally 'path')
+  if [ "${path}" = "path" ] && [ "${nodes}" = "nodes" ]; then
+    continue
+  fi
+
+  # Basic trim
+  path=$(echo "${path}" | ${SED} 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  nodes=$(echo "${nodes}" | ${SED} 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+  i=$((i+1))
+  [ $(( i % 100 )) -eq 0 ] && log "Processed ${i} lines…"
+
+  # Validate nodes string format
+  if ! valid_nodes_format "${nodes}"; then
+    echo -e "${path}\t${nodes}" >> "${INVALID_NODES}"
+    sum "${path}\t-\t${TARGET}\tskipped\tinvalid_nodes_format"
+    [ "${DEBUG}" -eq 1 ] && log "Invalid nodes format: '${nodes}' for ${path}"
+    continue
+  fi
+
+  ns=$(ns_from_path "${path}")
+  key=$(key_from_path "${path}")
+
+  # Target URL
+  url_tgt=$(build_url "${ns}" "${TARGET}" "${key}")
+  code_tgt=$(http_head_code "${url_tgt}")
+  scan "HEAD target ${TARGET} ${url_tgt} -> ${code_tgt}"
+
+  # If TSV says the object includes target and HEAD != 200, report as listed-but-missing
+  if echo "${nodes}" | ${GREP} -q "\\b${TARGET}\\b"; then
+    if [ "${code_tgt}" != "200" ]; then
+      echo -e "${path}\t${nodes}\t${code_tgt}" >> "${TSV_TARGET_LISTED_BUT_MISSING}"
+      sum "${path}\t-\t${TARGET}\tskipped\ttsv_target_listed_but_missing(${code_tgt})"
+      log "Listed target ${TARGET} for ${path} but HEAD=${code_tgt}"
+      continue
+    fi
+    # If HEAD=200 and listed → nothing to do
+    echo "${path}" >> "${SKIP_EXISTS}"
+    sum "${path}\t-\t${TARGET}\tskipped\texists_on_target"
+    [ "${DEBUG}" -eq 1 ] && log "Exists on target (listed): ${path}"
+    continue
+  fi
+
+  # If not listed on target but HEAD says it exists → skip (safety)
+  if [ "${code_tgt}" = "200" ]; then
+    echo "${path}" >> "${SKIP_EXISTS}"
+    sum "${path}\t-\t${TARGET}\tskipped\texists_on_target"
+    [ "${DEBUG}" -eq 1 ] && log "Exists on target (HEAD=200): ${path}"
+    continue
+  fi
+
+  # Multi-source? → do not copy, report for manual check
+  if echo "${nodes}" | ${GREP} -q ','; then
+    echo -e "${path}\t${nodes}" >> "${MULTI_SRC}"
+    sum "${path}\t${nodes}\t${TARGET}\tskipped\tmulti_source_listed"
+    [ "${DEBUG}" -eq 1 ] && log "Multi-source listed for ${path}: ${nodes}"
+    continue
+  fi
+
+  # Single-source
+  src_node="${nodes}"
+  if ! node_allowed "${src_node}"; then
+    echo -e "${path}\t${src_node}" >> "${NOT_IN_SOURCES}"
+    sum "${path}\t${src_node}\t${TARGET}\tskipped\tsource_not_in_allowed_list"
+    [ "${DEBUG}" -eq 1 ] && log "Source ${src_node} not in allowed list for ${path}"
+    continue
+  fi
+
+  url_src=$(build_url "${ns}" "${src_node}" "${key}")
+  code_src=$(http_head_code "${url_src}")
+  scan "HEAD source ${src_node} ${url_src} -> ${code_src}"
+
+  if [ "${code_src}" != "200" ]; then
+    echo -e "${path}\t${src_node}" >> "${NOT_ON_SOURCE}"
+    sum "${path}\t${src_node}\t${TARGET}\tskipped\thead_source_${code_src}"
+    [ "${DEBUG}" -eq 1 ] && log "Source HEAD=${code_src} for ${path}"
+    continue
+  fi
+
+  # At this point: target != 200, source == 200, single allowed source
+  if [ "${DRYRUN}" -eq 1 ]; then
+    echo -e "${path}\t${src_node}\t${TARGET}" >> "${WOULD_COPY}"
+    sum "${path}\t${src_node}\t${TARGET}\twould_copy\t-"
+    [ "${DEBUG}" -eq 1 ] && log "(dry-run) would copy ${path} from ${src_node} -> ${TARGET}"
+    continue
+  fi
+
+  # Real copy: download then upload
+  tmpfile="${OUTDIR}/downloaded_file.$$"
+  ok=0
+  attempt=1
+  while [ "${attempt}" -le "${RETRIES}" ]; do
+    [ "${DEBUG}" -eq 1 ] && log "Attempt ${attempt}/${RETRIES} download ${url_src}"
+    if download_object "${url_src}" "${tmpfile}"; then
+      [ "${DEBUG}" -eq 1 ] && log "Downloaded ${path} to ${tmpfile}"
+      [ "${DEBUG}" -eq 1 ] && log "Uploading to ${url_tgt}"
+      if upload_object "${url_tgt}" "${tmpfile}"; then
+        # Verify
+        code_after=$(http_head_code "${url_tgt}")
+        scan "VERIFY target ${TARGET} ${url_tgt} -> ${code_after}"
+        if [ "${code_after}" = "200" ]; then
+          ok=1
+          break
+        fi
+      fi
+    fi
+    attempt=$((attempt+1))
+  done
+  # Clean temp
+  [ -f "${tmpfile}" ] && ${RM} -f "${tmpfile}"
+
+  if [ "${ok}" -eq 1 ]; then
+    echo "${path}" >> "${COPIED}"
+    sum "${path}\t${src_node}\t${TARGET}\tcopied\t-"
+    log "Copied ${path} from ${src_node} -> ${TARGET}"
+  else
+    echo -e "${path}\t${src_node}" >> "${FAILED}"
+    sum "${path}\t${src_node}\t${TARGET}\tfailed\ttransfer_or_verify"
+    log "FAILED to copy ${path} from ${src_node} -> ${TARGET}"
+  fi
+
+done < "${LIST}"
+
+log "Done. Processed ${i} lines. See ${OUTDIR}"
+echo "Results: ${OUTDIR}"
