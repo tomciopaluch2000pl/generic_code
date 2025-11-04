@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# Purpose: Copy HCP objects listed in a 2-column file (path, nodes) into a single target node
+# Notes:
+# - This revision only changes HOW the input file is parsed:
+#   it now accepts either TABs or SPACEs as the column separator.
+#   Everything else (logging, outputs, flow) remains the same.
+
+set -euo pipefail
+
+# ---- helpers ----
+_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  hcp_copy_from_list.sh --list <file> --target <hcpN> --sources "<hcpN ...>" \
+                        --tenant <tenant> --domain <domain> --token '<token>' \
+                        [--retries N] [--dry-run] [--debug] [--insecure]
+
+Columns expected in --list:
+  path    nodes
+Where:
+  path  = namespace/prefix/.../object.ccf   (namespace is the first segment)
+  nodes = e.g. hcp1  OR hcp1,hcp2 (comma if multiple)  [SPACES or TAB are OK between columns]
+
+Outputs go to: output/<TIMESTAMP>_copy_to_<target>/
+EOF
+  exit 1
+}
+
+LIST=""
+TARGET=""
+SOURCES_STR=""
+TENANT=""
+DOMAIN=""
+TOKEN=""
+RETRIES=2
+DEBUG=0
+DRYRUN=0
+CURL_INSECURE=()
+
+# ---- args ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --list)    LIST="$2"; shift 2;;
+    --target)  TARGET="$2"; shift 2;;
+    --sources) SOURCES_STR="$2"; shift 2;;
+    --tenant)  TENANT="$2"; shift 2;;
+    --domain)  DOMAIN="$2"; shift 2;;
+    --token)   TOKEN="$2"; shift 2;;
+    --retries) RETRIES="${2}"; shift 2;;
+    --dry-run) DRYRUN=1; shift;;
+    --debug)   DEBUG=1; shift;;
+    --insecure) CURL_INSECURE=(-k); shift;;
+    -h|--help) usage;;
+    *) echo "Unknown arg: $1"; usage;;
+  esac
+done
+
+[[ -z "$LIST" || -z "$TARGET" || -z "$SOURCES_STR" || -z "$TENANT" || -z "$DOMAIN" || -z "$TOKEN" ]] && usage
+
+# Normalize sources into array (split on spaces)
+read -r -a SOURCES <<<"$SOURCES_STR"
+
+TS=$(date +%Y%m%d_%H%M%S)
+OUTDIR="output/${TS}_copy_to_${TARGET}"
+mkdir -p "$OUTDIR"
+
+LOG="${OUTDIR}/copy.log"
+SUMMARY="${OUTDIR}/copy_summary.tsv"
+WOULD="${OUTDIR}/would_copy.txt"
+SKIPPED_EXISTS="${OUTDIR}/skipped_exists.txt"
+FAILED="${OUTDIR}/failed.txt"
+NOT_IN_SOURCES="${OUTDIR}/not_in_sources.txt"
+MULTI_SRC="${OUTDIR}/multi_source.txt"
+TSV_TGT_LISTED_MISSING="${OUTDIR}/tsv_target_listed_but_missing.txt"
+CLEAN_IN="${OUTDIR}/clean.txt"  # for debug/trace of the parsed rows
+
+AWK=$(command -v awk)
+SED=$(command -v sed)
+GREP=$(command -v grep)
+CURL=$(command -v curl)
+
+# header
+{
+  echo "$(_ts) Output directory: $OUTDIR"
+  echo "$(_ts) Tenant/Domain: ${TENANT}.${DOMAIN}"
+  echo "$(_ts) Target: ${TARGET}"
+  echo "$(_ts) Sources allowed: ${SOURCES[*]}"
+  echo "$(_ts) Insecure: ${#CURL_INSECURE[@]}"
+  echo "$(_ts) Retries: ${RETRIES}"
+} | tee -a "$LOG" >/dev/null
+
+# summary header
+echo -e "path\tsource_node\ttarget_node\tresult\tinfo" > "$SUMMARY"
+
+# curl HEAD helper -> prints 200/404/403...
+head_code() {
+  local url="$1"
+  ${CURL} "${CURL_INSECURE[@]}" -sS -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: HCP ${TOKEN}" "$url" || echo "000"
+}
+
+# GET to file
+get_object() {
+  local url="$1" out="$2"
+  ${CURL} "${CURL_INSECURE[@]}" -sS -H "Authorization: HCP ${TOKEN}" \
+    "$url" -o "$out"
+}
+
+# PUT from file (binary)
+put_object() {
+  local url="$1" file="$2"
+  ${CURL} "${CURL_INSECURE[@]}" -sS -X PUT \
+    -H "Authorization: HCP ${TOKEN}" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary @"$file" \
+    "$url" -o /dev/null
+}
+
+# ---- main loop: robust row parsing (TAB or SPACES between columns) ----
+echo "$(_ts) Reading list: $LIST" | tee -a "$LOG" >/dev/null
+LINE_NO=0
+
+# We accept either TABs or SPACEs:
+# - First column = first AWK field
+# - Second column = last AWK field (so any middle noise is ignored)
+while IFS= read -r raw; do
+  LINE_NO=$((LINE_NO+1))
+  # trim
+  line=$(echo "$raw" | ${SED} 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [[ -z "$line" ]] && continue
+
+  # header row?
+  if echo "$line" | ${GREP} -qiE '^[[:space:]]*path[[:space:]]+nodes[[:space:]]*$'; then
+    [[ $DEBUG -eq 1 ]] && echo "$(_ts) [DEBUG] Skip header on line $LINE_NO" | tee -a "$LOG" >/dev/null
+    continue
+  fi
+
+  # pick first and last field as path / nodes (works for TABs or SPACEs)
+  path=$(${AWK} '{print $1}' <<<"$line")
+  nodes=$(${AWK} '{print $NF}' <<<"$line")
+
+  # keep a cleaned echo (optional trace)
+  echo "${path}	${nodes}" >> "$CLEAN_IN"
+
+  # sanity
+  if [[ -z "$path" || -z "$nodes" ]]; then
+    echo -e "${path}\t-\t${TARGET}\tskipped\tinvalid_nodes_format" | tee -a "$SUMMARY" >/dev/null
+    echo "$line" >> "${OUTDIR}/invalid_nodes_format.txt"
+    continue
+  fi
+
+  # parse namespace + object
+  ns="${path%%/*}"           # first segment before '/'
+  key="${path#*/}"           # everything after first '/'
+
+  # nodes can be single 'hcpN' OR a comma list 'hcpN,hcpM'
+  IFS=',' read -r -a NODE_LIST <<<"$nodes"
+  # normalize (trim spaces around entries)
+  for i in "${!NODE_LIST[@]}"; do
+    NODE_LIST[$i]=$(echo "${NODE_LIST[$i]}" | ${SED} 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  done
+
+  # Build URLs
+  url_for() { # $1 = node
+    echo "https://${ns}.${TENANT}.${1}.${DOMAIN}/rest/${key}"
+  }
+
+  # quick helper: is value in SOURCES?
+  in_sources=0
+  for s in "${SOURCES[@]}"; do
+    [[ "$s" == "${NODE_LIST[0]}" ]] && in_sources=1
+  done
+
+  # --- decision tree ---
+  if (( ${#NODE_LIST[@]} >= 2 )); then
+    # multiple nodes listed in the file
+    # If target is listed: verify it really exists at target; if not → record mismatch.
+    if printf '%s\0' "${NODE_LIST[@]}" | ${GREP} -zqx "$TARGET"; then
+      tgt_url=$(url_for "$TARGET")
+      code=$(head_code "$tgt_url")
+      if [[ "$code" == "200" ]]; then
+        echo -e "${path}\t-\t${TARGET}\tskipped\ttarget_already_has_object" | tee -a "$SUMMARY" >/dev/null
+        echo "$(_ts) SKIP (multi-node, target confirmed 200): $path" >> "$LOG"
+      else
+        echo -e "${path}\t-\t${TARGET}\tskipped\ttsv_target_listed_but_missing" | tee -a "$SUMMARY" >/dev/null
+        echo "$path" >> "$TSV_TGT_LISTED_MISSING"
+        echo "$(_ts) WARN (multi-node, target listed but HEAD=${code}): $path" >> "$LOG"
+      fi
+    else
+      # multi-source but without target in list → manual path
+      echo -e "${path}\t-\t${TARGET}\tskipped\tmulti_source_listed" | tee -a "$SUMMARY" >/dev/null
+      echo "$path    ${nodes}" >> "$MULTI_SRC"
+      echo "$(_ts) SKIP (multi-source): $path nodes=[${nodes}]" >> "$LOG"
+    fi
+    continue
+  fi
+
+  # here: exactly one node in the list
+  SRC_NODE="${NODE_LIST[0]}"
+
+  # if it's already the target → verify existence then skip
+  if [[ "$SRC_NODE" == "$TARGET" ]]; then
+    tgt_url=$(url_for "$TARGET")
+    code=$(head_code "$tgt_url")
+    if [[ "$code" == "200" ]]; then
+      echo -e "${path}\t${TARGET}\t${TARGET}\tskipped\ttarget_already_has_object" | tee -a "$SUMMARY" >/dev/null
+      echo "$(_ts) SKIP (already at target): $path" >> "$LOG"
+    else
+      echo -e "${path}\t${TARGET}\t${TARGET}\tskipped\ttsv_target_listed_but_missing" | tee -a "$SUMMARY" >/dev/null
+      echo "$path" >> "$TSV_TGT_LISTED_MISSING"
+      echo "$(_ts) WARN (listed target but HEAD=${code}): $path" >> "$LOG"
+    fi
+    continue
+  fi
+
+  # check source is in allowed sources
+  allow=0
+  for s in "${SOURCES[@]}"; do [[ "$s" == "$SRC_NODE" ]] && allow=1; done
+  if (( allow == 0 )); then
+    echo -e "${path}\t${SRC_NODE}\t${TARGET}\tskipped\tnot_in_sources_allowlist" | tee -a "$SUMMARY" >/dev/null
+    echo "$path    ${SRC_NODE}" >> "$NOT_IN_SOURCES"
+    echo "$(_ts) SKIP (not in allowed sources): $path from ${SRC_NODE}" >> "$LOG"
+    continue
+  fi
+
+  SRC_URL=$(url_for "$SRC_NODE")
+  DST_URL=$(url_for "$TARGET")
+
+  # if destination already has it → skip
+  dst_code=$(head_code "$DST_URL")
+  if [[ "$dst_code" == "200" ]]; then
+    echo -e "${path}\t${SRC_NODE}\t${TARGET}\tskipped\ttarget_already_has_object" | tee -a "$SUMMARY" >/dev/null
+    echo "$(_ts) SKIP (target 200): $path" >> "$LOG"
+    continue
+  fi
+
+  # verify source actually has it
+  src_code=$(head_code "$SRC_URL")
+  if [[ "$src_code" != "200" ]]; then
+    echo -e "${path}\t${SRC_NODE}\t${TARGET}\tskipped\tsource_missing_or_forbidden(${src_code})" | tee -a "$SUMMARY" >/dev/null
+    echo "$(_ts) SKIP (source !200=${src_code}): $path" >> "$LOG"
+    continue
+  fi
+
+  # dry run?
+  if (( DRYRUN == 1 )); then
+    echo "$path" >> "$WOULD"
+    echo -e "${path}\t${SRC_NODE}\t${TARGET}\twould_copy\t-" | tee -a "$SUMMARY" >/dev/null
+    [[ $DEBUG -eq 1 ]] && {
+      echo "$(_ts) DRY-RUN would copy: $path  SRC=${SRC_URL}" >> "$LOG"
+    }
+    continue
+  fi
+
+  # perform copy: GET → PUT (binary)
+  tmpfile="${OUTDIR}/downloaded_file.ccf"
+  ok=0
+  attempt=0
+  while (( attempt < RETRIES )); do
+    attempt=$((attempt+1))
+    echo "$(_ts) Attempt ${attempt}/${RETRIES} GET $SRC_URL" >> "$LOG"
+    if get_object "$SRC_URL" "$tmpfile"; then
+      echo "$(_ts) PUT to $DST_URL" >> "$LOG"
+      if put_object "$DST_URL" "$tmpfile"; then
+        # verify
+        vcode=$(head_code "$DST_URL")
+        if [[ "$vcode" == "200" ]]; then
+          ok=1
+          break
+        fi
+        echo "$(_ts) VERIFY failed (HEAD=$vcode)" >> "$LOG"
+      else
+        echo "$(_ts) PUT failed" >> "$LOG"
+      fi
+    else
+      echo "$(_ts) GET failed" >> "$LOG"
+    fi
+    sleep 1
+  done
+  rm -f "$tmpfile" || true
+
+  if (( ok == 1 )); then
+    echo -e "${path}\t${SRC_NODE}\t${TARGET}\tcopied\t-" | tee -a "$SUMMARY" >/dev/null
+  else
+    echo -e "${path}\t${SRC_NODE}\t${TARGET}\tfailed\tcopy_or_verify_failed" | tee -a "$SUMMARY" >/dev/null
+    echo "$path" >> "$FAILED"
+  fi
+
+done < "$LIST"
+
+echo "$(_ts) Done." | tee -a "$LOG" >/dev/null
