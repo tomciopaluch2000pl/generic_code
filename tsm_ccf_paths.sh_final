@@ -1,0 +1,154 @@
+
+#!/usr/bin/env bash
+# =============================================================================
+# NAME:        ccf_extractor.sh
+# PURPOSE:     Generate a unique list of container file paths (.ccf)
+#              for archived objects matching given filters.
+#
+# DESCRIPTION:
+#   The script connects to a backup/archive server using the admin CLI,
+#   retrieves object IDs matching filespace_name and ll_name LIKE,
+#   extracts related container IDs, and then queries the database (DB2)
+#   to obtain the physical container file paths.
+#
+# USAGE EXAMPLE:
+#   ./ccf_extractor.sh \
+#       --server SERVER1 \
+#       --user admin1 \
+#       --pass 'password' \
+#       --filespace '/DATA/ARCHIVE' \
+#       --like 'FILE123%' \
+#       --db TSMDB1 --schema TSMDB1 \
+#       --out-dir /tmp
+#
+# OUTPUT FILES:
+#   <out-dir>/object_ids.txt         - list of object IDs
+#   <out-dir>/objid_to_container.csv - mapping object_id,container_id
+#   <out-dir>/container_ids.txt      - list of unique container IDs
+#   <out-dir>/ccf_paths.txt          - list of unique .ccf container paths
+#
+# REQUIREMENTS:
+#   - dsmadmc (administrative CLI) in PATH
+#   - db2 command line tool available and a cataloged database name
+#
+# =============================================================================
+set -euo pipefail
+
+# ---- Defaults ----------------------------------------------------------------
+OUT_DIR="/tmp"
+DSMADMC_BIN="${DSMADMC_BIN:-dsmadmc}"
+DB2_BIN="${DB2_BIN:-db2}"
+DB_NAME="TSMDB1"
+DB_SCHEMA="TSMDB1"
+
+SERVER=""; USER=""; PASS=""
+FILESPACE=""; LIKEPAT=""
+
+print_usage() {
+  cat <<EOF
+Usage:
+  $0 --server <SERVERNAME> --user <ID> --pass <PASSWORD> \\
+     --filespace <FILESAPCE_NAME> --like <LIKE_PATTERN> \\
+     [--db DBNAME] [--schema SCHEMA] [--out-dir DIR]
+EOF
+}
+
+# ---- Argument parsing ---------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --server)    SERVER="${2:-}"; shift 2 ;;
+    --user)      USER="${2:-}"; shift 2 ;;
+    --pass)      PASS="${2:-}"; shift 2 ;;
+    --filespace) FILESPACE="${2:-}"; shift 2 ;;
+    --like)      LIKEPAT="${2:-}"; shift 2 ;;
+    --db)        DB_NAME="${2:-}"; shift 2 ;;
+    --schema)    DB_SCHEMA="${2:-}"; shift 2 ;;
+    --out-dir)   OUT_DIR="${2:-}"; shift 2 ;;
+    -h|--help)   print_usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; print_usage; exit 1 ;;
+  esac
+done
+
+# ---- Validation ---------------------------------------------------------------
+[[ -n "$SERVER"    ]] || { echo "ERROR: --server required" >&2; exit 1; }
+[[ -n "$USER"      ]] || { echo "ERROR: --user required" >&2; exit 1; }
+[[ -n "$PASS"      ]] || { echo "ERROR: --pass required" >&2; exit 1; }
+[[ -n "$FILESPACE" ]] || { echo "ERROR: --filespace required" >&2; exit 1; }
+[[ -n "$LIKEPAT"   ]] || { echo "ERROR: --like required" >&2; exit 1; }
+
+mkdir -p "$OUT_DIR"
+
+OBJ_FILE="${OUT_DIR}/object_ids.txt"
+MAP_FILE="${OUT_DIR}/objid_to_container.csv"
+CID_FILE="${OUT_DIR}/container_ids.txt"
+SQL_FILE="${OUT_DIR}/get_ccf.sql"
+RAW_FILE="${OUT_DIR}/ccf_paths.raw"
+CCF_FILE="${OUT_DIR}/ccf_paths.txt"
+
+# ---- Helper functions ---------------------------------------------------------
+run_dsmadmc_csv() {
+  "$DSMADMC_BIN" -se="$SERVER" -id="$USER" -password="$PASS" \
+                 -comma -dataonly=yes "$@"
+}
+
+extract_container_ids_from_show() {
+  grep -Eo 'Container ID:[[:space:]]*[0-9]+' | awk '{print $3}'
+}
+
+trim() { awk '{$1=$1;print}'; }
+
+# ---- Step 1: Retrieve object IDs ---------------------------------------------
+SQL="select object_id from archives where filespace_name='${FILESPACE}' and ll_name like '${LIKEPAT}'"
+run_dsmadmc_csv "$SQL" \
+  | tr -d '\r' \
+  | awk -F',' 'NF>=1 {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); gsub(/"/,"",$1); if ($1~/^[0-9]+$/) print $1;}' \
+  | sort -n > "$OBJ_FILE"
+
+if [[ ! -s "$OBJ_FILE" ]]; then
+  echo "No matching object IDs found." >&2
+  exit 2
+fi
+echo "Object IDs saved to $OBJ_FILE (count: $(wc -l < "$OBJ_FILE"))"
+
+# ---- Step 2: Extract container IDs -------------------------------------------
+echo "object_id,container_id" > "$MAP_FILE"
+while IFS= read -r OID; do
+  OUT="$("$DSMADMC_BIN" -se="$SERVER" -id="$USER" -password="$PASS" \
+        "show invo ${OID} listchun=yes" 2>/dev/null || true)"
+  if [[ -n "$OUT" ]]; then
+    echo "$OUT" | extract_container_ids_from_show \
+      | while read -r CID; do
+          [[ -n "$CID" ]] && echo "${OID},${CID}" >> "$MAP_FILE"
+        done
+  fi
+done < "$OBJ_FILE"
+
+awk -F',' 'NR>1{print $2}' "$MAP_FILE" | sort -n | uniq > "$CID_FILE"
+echo "Unique container IDs saved to $CID_FILE (count: $(wc -l < "$CID_FILE"))"
+
+# ---- Step 3: Query database for container paths ------------------------------
+{
+  echo "connect to ${DB_NAME};"
+  echo "set schema ${DB_SCHEMA};"
+  while IFS= read -r CID; do
+    [[ -n "$CID" ]] && echo "select cntrname from sd_containers where cntrid=${CID};"
+  done < "$CID_FILE"
+} > "$SQL_FILE"
+
+"$DB2_BIN" -txf "$SQL_FILE" > "$RAW_FILE" 2>/dev/null || {
+  echo "DB2 query failed. Check ${RAW_FILE} for details." >&2
+  exit 3
+}
+
+tr -d '\r' < "$RAW_FILE" \
+  | awk 'NF>0 {gsub(/^[[:space:]]+|[[:space:]]+$/,""); print}' \
+  | sort -u > "$CCF_FILE"
+
+# ---- Step 4: Summary ---------------------------------------------------------
+echo
+echo "Process completed successfully."
+echo " • Object IDs file:        $OBJ_FILE"
+echo " • Object->Container map:  $MAP_FILE"
+echo " • Container ID list:      $CID_FILE"
+echo " • Final CCF path list:    $CCF_FILE"
+echo "Unique CCF paths found: $(wc -l < "$CCF_FILE")"
