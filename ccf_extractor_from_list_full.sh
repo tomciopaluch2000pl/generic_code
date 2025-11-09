@@ -11,9 +11,6 @@
 #
 # INPUT FILE FORMAT (one per line, comma-separated):
 #   <filespace_name>,<ll_name>
-#   Examples:
-#     /DGCEP11B/GAA,11887FAAA
-#     /DGCEP11B/ZWA,1850
 #
 # SCOPE / MATCHING:
 #   For each input line we extract the numeric prefix from ll_name
