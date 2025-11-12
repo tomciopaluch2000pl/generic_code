@@ -1,0 +1,45 @@
+Strengths and achievements
+
+This year I consistently delivered on my core responsibilities and key objectives while supporting several high-impact initiatives across Storage Protect, CMOD, Landing Zone, and federation programs. I ensured stable L3 operations and ownership of the distributed and z/OS areas, enabling continuity for business-critical applications.
+
+I successfully executed the Landing Zone Data Transfer (CS → UBS) project, completing the pipeline design, procurement, authentication setup (vault, certificates, ATTI/Goto), and automation required for PoC, TE2 and CH. Despite limited test data from CS, I delivered the solution on time, ensuring secure and robust data exchange to Azure storage.
+Example: I identified a metadata mismatch in CS feeds that would have caused TE2 failures, coordinated with architects and resolved the issue ahead of schedule.
+
+I completed full installation and configuration of CMOD China HUB across DEV–PROD, including silent installation scripting for Storage Protect on RHEL8 and infrastructure sizing.
+Example: During DR validation I found a retention policy issue that would have broken compliance. I corrected the configuration and documented the remediation for future deployments.
+
+I provided strong technical leadership in LA HUB federation, collaborating with IBM Support and internal SMEs to validate connectivity and design.
+Example: I resolved a certificate chain issue that blocked APAC federation tests, enabling the team to proceed with schedule-critical steps.
+
+Additionally, I onboarded a new Software Engineer and delivered structured KT sessions covering Storage Protect, CMOD and L3 processes.
+Example: After 6 weeks, he could independently handle L3 cases and participate in federation testing, reducing dependency on a single SME.
+
+Across all initiatives I maintained stable operations, proactively addressed risks, and ensured high quality of deliverables.
+
+⸻
+
+✅ 2. Development areas
+
+While this year was highly productive, I see clear areas where I can further improve my impact. One focus is increasing delegation and distributing domain knowledge across the team to minimise concentration of expertise. Although onboarding of the new engineer was successful, I can continue strengthening documentation and enabling more team members to take ownership of federations, installations, or L3 investigations.
+
+Another opportunity is to scale automation further. While I adopted Copilot and AI-supported documentation in several projects, I see room to standardize this and integrate automation into more repetitive daily operational tasks.
+
+Additionally, I plan to improve proactive communication around complex dependencies between projects. Some initiatives (e.g., Landing Zone with multiple cross-team handshakes) would benefit from earlier stakeholder alignment and more structured progress visibility.
+
+⸻
+
+✅ 3. UBS Behaviors
+
+Accountability with Integrity:
+I consistently take ownership of complex tasks and cross-team issues.
+Example: During CS → UBS TE2 validation I initiated and led a triage call, provided the root-cause analysis within hours, and coordinated actions across Infra, Architecture and CS teams.
+
+Collaboration:
+I regularly collaborate with architects, Infra Owners, and IBM Support to align designs, resolve blockers and ensure quality.
+Example: In LA HUB federation I coordinated multiple dependency fixes (certificates, NGIX configuration) and ensured transparency for all stakeholders.
+
+Risk Management:
+I proactively identify and mitigate operational and compliance risks.
+Example: During China HUB production preparation, I escalated and resolved a non-compliant retention configuration, ensuring alignment with UBS data retention standards.
+
+I believe these behaviors supported successful delivery across regions and helped drive stability and quality in the areas I own.
