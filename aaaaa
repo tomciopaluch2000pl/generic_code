@@ -1,0 +1,6 @@
+Delivered the complete PoC, TE2, and CH production deployment of the Landing Zone data transfer pipeline within the agreed Q2 timeline despite limited test data availability from CS.
+• Designed and implemented the full end-to-end transfer pipeline, including authentication workflow, vault- and certificate-based access, network zone alignment, and automated azcopy integration.
+• Completed successful procurement, storage sizing, and infrastructure configuration (~250 TB) to support a 7-day processing backlog and ensure stability across the UBS environment.
+• Automated file validation, decomposition, integrity checks, routing logic (HDR vs TransArch), and post-delivery backup processes, enabling a fully scalable and maintainable solution.
+• Established secure, reliable, and repeatable data flow between UBS Landing Zone and HDR/TransArch, creating the foundation for future EMEA and AMER onboarding phases.
+• Strengthened UBS cloud integration standards by delivering reusable patterns, documentation, and operational runbooks for ongoing support and expansion.
