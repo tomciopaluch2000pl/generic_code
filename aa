@@ -1,0 +1,6 @@
+Managed end-to-end storage procurement and infrastructure preparation for the new CMOD China HUB, including accurate storage sizing, provisioning, and alignment with NGIX platform requirements.
+• Developed fully automated scripts for box resizing and silent Storage Protect installation on RHEL8, reducing manual effort and ensuring consistent deployment across environments.
+• Delivered a complete and operational CMOD China HUB environment across all stages (DEV, TE1, TE2, PROD), meeting project timelines and stability requirements.
+• Ensured full compliance with UBS data retention, logging, and security standards, coordinating with platform and infra owners to validate controls.
+• Produced comprehensive installation and configuration documentation to guarantee repeatability, audit readiness, and long-term maintainability.
+• Provided structured knowledge transfer sessions to future L2 support teams to ensure readiness for operational takeover.
