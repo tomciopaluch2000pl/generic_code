@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------
+# make_fs_macro.sh
+# Generate Spectrum Protect RENAME FILESPACE macro from mapping CSV.
+#
+# Columns (1-based, zgodnie z Twoim plikiem):
+#   2  -> OD_INSTAME_SRC      (old instance)
+#   5  -> AGID_NAME_SRC       (old AGID)
+#   6  -> OD_INSTAME_DST      (new instance)
+#   9  -> AGID_NAME_DST       (new AGID)
+#   11 -> OD_NODENAME         (node, np. E1-ODCN_S_0202_01O)
+#
+# Output:
+#   rename filespace <NODE> "/old_inst/old_agid" "/new_inst/new_agid"
+#   ...
+#   quit
+#
+# Usage:
+#   ./make_fs_macro.sh TSM_FILESPACEMAP_PROD_EMEA.csv > fs_rename_$(date +%Y%m%d_%H%M%S).mac
+#   ./make_fs_macro.sh TSM_FILESPACEMAP_PROD_EMEA.csv fs_rename_all.mac
+#
+# Safety:
+#   - jeśli podasz nazwę pliku wyjściowego i on już istnieje -> błąd, brak overwrite
+#   - duplikaty (ten sam node+old_fs+new_fs) są pomijane
+# ----------------------------------------------------------------------
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <input.csv> [output.mac]" >&2
+  exit 1
+fi
+
+csv_file=$1
+out_file=${2:-}   # jeśli brak -> STDOUT
+
+if [[ ! -f "$csv_file" ]]; then
+  echo "ERROR: CSV file not found: $csv_file" >&2
+  exit 1
+fi
+
+# Nie nadpisuj istniejącego pliku makra
+if [[ -n "$out_file" && -e "$out_file" ]]; then
+  echo "ERROR: Output file already exists: $out_file" >&2
+  echo "       Choose a different name (np. z timestampem) lub usuń plik ręcznie." >&2
+  exit 1
+fi
+
+# Gdzie pisać wynik
+if [[ -n "$out_file" ]]; then
+  exec >"$out_file"
+fi
+
+# Nagłówek informacyjny
+echo "* Macro generated from $csv_file"
+echo "* rename filespace <NODE> \"/old_inst/old_agid\" \"/new_inst/new_agid\""
+echo
+
+# Generujemy komendy. Zakładamy brak przecinków w polach (tak jak u Ciebie).
+awk -F',' '
+  BEGIN {
+    # mapowanie indeksów kolumn (1-based):
+    COL_OLD_INST = 2;   # OD_INSTAME_SRC
+    COL_OLD_AGID = 5;   # AGID_NAME_SRC
+    COL_NEW_INST = 6;   # OD_INSTAME_DST
+    COL_NEW_AGID = 9;   # AGID_NAME_DST
+    COL_NODE     = 11;  # OD_NODENAME (E1-ODCN_...)
+  }
+
+  NR == 1 { next }   # pomijamy header
+
+  {
+    # Bezpiecznie: sprawdź, czy mamy wystarczającą liczbę kolumn
+    if (NF < COL_NODE) {
+      # za mało kolumn – pomijamy
+      next
+    }
+
+    node     = $COL_NODE
+    old_inst = $COL_OLD_INST
+    old_agid = $COL_OLD_AGID
+    new_inst = $COL_NEW_INST
+    new_agid = $COL_NEW_AGID
+
+    # Pomijamy wiersze niekompletne
+    if (node == "" || old_inst == "" || old_agid == "" || new_inst == "" || new_agid == "") {
+      next
+    }
+
+    old_fs = "/" old_inst "/" old_agid
+    new_fs = "/" new_inst "/" new_agid
+
+    key = node "|" old_fs "|" new_fs
+    if (seen[key]++) {
+      # duplikat – nic nie generujemy drugi raz
+      next
+    }
+
+    # escapowanie cudzysłowów w razie czego
+    gsub(/"/, "\"\"", old_fs)
+    gsub(/"/, "\"\"", new_fs)
+
+    print "rename filespace " node " \"" old_fs "\" \"" new_fs "\""
+  }
+
+  END {
+    print ""
+    print "quit"
+  }
+' "$csv_file"
