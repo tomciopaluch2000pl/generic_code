@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------
+# generate_fs_macros.sh
+#
+# Purpose:
+#   Read a CMOD→TSM mapping CSV and generate:
+#     1) main macro  : rename filespace <NODE> "/OLD_INST/OLD_AGID" "/NEW_INST/NEW_AGID"
+#     2) rollback macro: the inverse operations
+#     3) full plan log CSV for auditing
+#
+# Assumptions about CSV columns (1-based indices):
+#   2  -> OD_INSTAME_SRC   (old instance name)
+#   5  -> AGID_NAME_SRC    (old AGID / old filespace suffix)
+#   6  -> OD_INSTAME_DST   (new instance name)
+#   9  -> AGID_NAME_DST    (new AGID / new filespace suffix)
+#   13 -> NODE name        (TSM nodename, e.g. E1-ODCN_S_0202_01OY_6)
+#
+# Output files:
+#   <prefix>_rename.mac        - macro with all RENAME FILESPACE commands
+#   <prefix>_rollback.mac      - macro with reverse RENAME FILESPACE commands
+#   <prefix>_rename_plan.csv   - log with node, old_fs, new_fs, etc.
+#
+# Safety:
+#   - Script will NOT overwrite existing output files.
+#   - Duplicate triplets (node, old_fs, new_fs) are generated only once.
+#
+# Usage:
+#   ./generate_fs_macros.sh input.csv
+#   ./generate_fs_macros.sh input.csv custom_prefix
+#
+# Then run in TSM:
+#   dsmadmc -se <SERVER> -id <USER> -pa <PASS> -noc -cmdfile=<prefix>_rename.mac
+#   dsmadmc -se <SERVER> -id <USER> -pa <PASS> -noc -cmdfile=<prefix>_rollback.mac   # to undo
+# ----------------------------------------------------------------------
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <input.csv> [prefix]" >&2
+  exit 1
+fi
+
+input_csv=$1
+prefix=${2:-}
+
+if [[ ! -f "$input_csv" ]]; then
+  echo "ERROR: Input CSV not found: $input_csv" >&2
+  exit 1
+fi
+
+# Derive prefix if not provided
+if [[ -z "$prefix" ]]; then
+  base=$(basename "$input_csv")
+  base=${base%.*}
+  ts=$(date +%Y%m%d_%H%M%S)
+  prefix="${base}_${ts}"
+fi
+
+macro_main="${prefix}_rename.mac"
+macro_rollback="${prefix}_rollback.mac"
+log_plan="${prefix}_rename_plan.csv"
+
+# Do not overwrite existing files
+for f in "$macro_main" "$macro_rollback" "$log_plan"; do
+  if [[ -e "$f" ]]; then
+    echo "ERROR: Output file already exists: $f" >&2
+    echo "       Please remove it or use a different prefix." >&2
+    exit 1
+  fi
+done
+
+# Open file descriptors:
+#  3 -> main macro
+#  4 -> rollback macro
+#  5 -> csv plan log
+exec 3> "$macro_main"
+exec 4> "$macro_rollback"
+exec 5> "$log_plan"
+
+echo "* Macro generated from $input_csv" >&3
+echo "* RENAME operations" >&3
+echo >&3
+
+echo "* Rollback macro generated from $input_csv" >&4
+echo "* INVERSE operations" >&4
+echo >&4
+
+echo "node,old_fs,new_fs,old_inst,old_agid,new_inst,new_agid" >&5
+
+# AWK to parse CSV and emit commands/log
+awk -F',' '
+  BEGIN {
+    # Column mapping (1-based)
+    COL_OLD_INST = 2;   # old instance (OD_INSTAME_SRC)
+    COL_OLD_AGID = 5;   # old AGID (AGID_NAME_SRC)
+    COL_NEW_INST = 6;   # new instance (OD_INSTAME_DST)
+    COL_NEW_AGID = 9;   # new AGID (AGID_NAME_DST)
+    COL_NODE     = 13;  # TSM node name (e.g. E1-ODCN_S_0202_01OY_6)
+  }
+  NR == 1 {
+    # Skip header line
+    next
+  }
+  {
+    # Remove trailing CR (Windows CSV)
+    sub(/\r$/, "", $0)
+
+    # Basic safety: ensure we have enough columns
+    if (NF < COL_NODE) {
+      next
+    }
+
+    node     = $COL_NODE
+    old_inst = $COL_OLD_INST
+    old_agid = $COL_OLD_AGID
+    new_inst = $COL_NEW_INST
+    new_agid = $COL_NEW_AGID
+
+    # Skip incomplete rows
+    if (node == "" || old_inst == "" || old_agid == "" || new_inst == "" || new_agid == "") {
+      next
+    }
+
+    old_fs = "/" old_inst "/" old_agid
+    new_fs = "/" new_inst "/" new_agid
+
+    # Deduplicate: same node + old_fs + new_fs only once
+    key = node "|" old_fs "|" new_fs
+    if (seen[key]++ > 0) {
+      next
+    }
+
+    # Escape double quotes in paths
+    gsub(/"/, "\"\"", old_fs)
+    gsub(/"/, "\"\"", new_fs)
+
+    # Main macro: old -> new
+    printf("rename filespace %s \"%s\" \"%s\"\n",
+           node, old_fs, new_fs) >>3
+
+    # Rollback macro: new -> old
+    printf("rename filespace %s \"%s\" \"%s\"\n",
+           node, new_fs, old_fs) >>4
+
+    # Plan log
+    printf("%s,%s,%s,%s,%s,%s,%s\n",
+           node, old_fs, new_fs, old_inst, old_agid, new_inst, new_agid) >>5
+  }
+  END {
+    print "" >>3
+    print "quit" >>3
+
+    print "" >>4
+    print "quit" >>4
+  }
+' "$input_csv"
+
+# Close FDs
+exec 3>&-
+exec 4>&-
+exec 5>&-
+
+echo "Generated files:"
+echo "  Macro     : $macro_main"
+echo "  Rollback  : $macro_rollback"
+echo "  Plan log  : $log_plan"
