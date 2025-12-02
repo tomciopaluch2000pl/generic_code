@@ -1,0 +1,32 @@
+Using only the meeting minutes provided as input, identify inconsistencies restricted to the following three categories:
+
+1. Tasks assigned to people who are marked as “Excused”.
+2. Tasks with due dates earlier than the meeting date.
+3. Tasks that contradict the stated current context (e.g., asking someone to allocate budget when the budget is frozen).
+
+Authoritative rules:
+- The “Excused:” line is the only valid source of excused attendees.
+- A person is excused only if their name appears exactly and verbatim in that line.
+- Do not infer excused status from task content or context.
+- Do not report issues outside the three allowed categories.
+
+Language rules:
+- Do NOT use phrases such as “Action point”, “Action points”, “Action item”, “Task assignment”, “The action for…”, or any similar label.
+- Each bullet must be a short, natural, factual English sentence, written the same way as the acceptable example responses on the platform.
+
+Output format — use exactly one option:
+
+A) If at least one inconsistency is found:
+Potential problems in the meeting minutes:
+- <Short, natural English sentence describing the first inconsistency.>
+- <Second inconsistency if applicable.>
+(Include bullets only for issues clearly matching the three allowed categories.)
+
+B) If no inconsistencies of the allowed types are found:
+No problems found.
+
+Formatting rules:
+- Use exactly the heading “Potential problems in the meeting minutes:” when listing issues.
+- Each issue must begin with “- ”.
+- Do not add commentary, explanations, or extra text before or after the required output.
+- Do not rephrase formats A or B; use them exactly as written.
