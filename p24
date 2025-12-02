@@ -1,0 +1,30 @@
+Using only the meeting minutes provided as input, identify inconsistencies of the following three types:
+
+1) A task is assigned to a person who is listed as “Excused”.
+2) A task has a due date that is earlier than the meeting date.
+3) A task contradicts the current context (for example, asking someone to allocate budget while the budget is frozen).
+
+Authoritative rules:
+- The “Excused:” line is the ONLY valid source for excused attendees.
+- A person is excused ONLY if their name appears EXACTLY and VERBATIM in the “Excused:” field.
+- Do NOT infer excused status from context, actions, or implications.
+- Do NOT generate any issues unless they fall strictly within the three allowed categories.
+
+Output format (use EXACTLY one of the two):
+
+A) If at least one inconsistency is found:
+Potential problems in the meeting minutes:
+- <Write each issue as a short, natural English sentence.>
+- <Second issue, if any.>
+
+B) If no inconsistencies of the allowed types are found:
+No problems found.
+
+Formatting rules:
+- Use EXACTLY the heading: “Potential problems in the meeting minutes:” when listing issues.
+- EACH issue must begin with “- ”.
+- Write each bullet as a normal English sentence (not a label, not “Action point…”).
+- Match the tone and length of the acceptable examples (short, factual, businesslike).
+- Do NOT invent issues beyond the three categories.
+- Do NOT add commentary, explanations, or any text before or after the required output.
+- Do NOT rephrase formats A or B; use them EXACTLY as written.
