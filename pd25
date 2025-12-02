@@ -1,0 +1,33 @@
+Using the meeting minutes provided as input, identify any inconsistencies.
+
+Evaluate ONLY the following three categories:
+1) Actions assigned to people who are marked as “Excused”.
+2) Actions with due dates earlier than the meeting date.
+3) Actions that contradict the stated context (e.g., allocating budget while the budget is frozen).
+
+Authoritative rules:
+- Treat ONLY the “Excused:” line as the definitive list of excused attendees.
+- A person is excused ONLY if their name appears EXACTLY and VERBATIM in that line.
+- Do NOT assume or infer excused status from any other text.
+- Do NOT generate an excused-related issue unless it strictly follows the above rule.
+
+Output format — use EXACTLY one:
+
+A) If at least one inconsistency exists:
+Potential problems in the meeting minutes:
+- <A short, natural English sentence describing the first inconsistency.>
+- <A short, natural English sentence describing the second inconsistency.>
+(Continue only if more issues clearly fall within the three allowed categories.)
+
+B) If no inconsistencies exist:
+No problems found.
+
+Style and formatting rules:
+- Use EXACTLY the heading “Potential problems in the meeting minutes:” when listing issues.
+- Begin each issue with “- ”.
+- Write each bullet as a natural, concise English sentence referring to the specific person and action (e.g., “Tom is excused but is assigned to freeze new allocations.”).
+- Do NOT start bullets with phrases like “A task…” or “An action point…”.
+- Match the tone and brevity of the acceptable responses (short, factual, businesslike).
+- Do NOT add commentary, labels, summaries, or any text before or after the required output.
+- Do NOT invent issues outside the three categories.
+- Do NOT rephrase formats A or B; use them exactly.
