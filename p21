@@ -1,0 +1,25 @@
+Using the meeting minutes provided as input, identify only the following types of inconsistencies:
+
+1) Action points assigned to people who are marked as “Excused”.
+2) Action points with due dates earlier than the meeting date.
+3) Action points that contradict the current context (for example, asking someone to allocate budget while the budget is frozen).
+
+Then produce the output in exactly one of the two formats below:
+
+A) If at least one inconsistency is found:
+Potential problems in the meeting minutes:
+- <first inconsistency written as a short, factual, natural-sounding sentence>
+- <second inconsistency, same style>
+(Continue bullets only if more valid inconsistencies of the three types exist.)
+
+B) If no inconsistencies of these types exist:
+No problems found.
+
+Formatting and content rules:
+- Use ONLY the exact heading “Potential problems in the meeting minutes:” when issues exist.
+- Start each issue on a new line beginning with “- ”.
+- Write each bullet as a complete English sentence (not a label).
+- Match the tone, clarity, and sentence style of the acceptable example responses.
+- Do NOT add any explanations, summaries, or text before or after the required output.
+- Do NOT invent additional issues beyond the three allowed categories.
+- Do NOT rephrase formats A or B; use them EXACTLY as written.
