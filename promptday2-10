@@ -1,0 +1,26 @@
+Using the meeting minutes provided as input, identify any inconsistencies. 
+Focus ONLY on the following three categories:
+
+1) Action points assigned to people who are marked as "Excused".
+2) Action points with due dates that occur earlier than the meeting date.
+3) Action points that contradict the described current context.
+
+Then produce the output in exactly one of the following formats:
+
+A) If you find at least one inconsistency:
+Potential problems in the meeting minutes:
+- <first inconsistency written as one natural, concise English sentence>
+- <second inconsistency as one natural, concise English sentence>
+(Continue bullets only if more clear inconsistencies exist, strictly from the three categories above.)
+
+B) If you do NOT find any inconsistencies:
+No problems found.
+
+Formatting rules (follow EXACTLY):
+- Use ONLY the heading “Potential problems in the meeting minutes:” when listing issues.
+- Start each issue on a new line beginning with “- ” and nothing else.
+- Each bullet must be a short, factual, natural-sounding sentence (not a label).
+- Match the tone, clarity, and sentence style of the acceptable examples exactly.
+- Do NOT add explanations, summaries, or any other text before or after the required output.
+- Do NOT invent additional problems beyond the three allowed categories.
+- Do NOT rephrase formats A or B; use them EXACTLY as written.
