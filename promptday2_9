@@ -1,0 +1,24 @@
+You are evaluating meeting minutes for inconsistencies.  
+Your task is to identify only the following three issue types:  
+1) Action points assigned to people marked as *Excused*.  
+2) Action points with due dates earlier than the meeting date.  
+3) Action points that contradict the stated current context.
+
+Produce the output in exactly one of the two formats:
+
+A) If at least one inconsistency is found:
+Potential problems in the meeting minutes:
+- <each inconsistency written as a complete, natural English sentence>
+- <each issue must be a standalone sentence, similar in tone and length to the acceptable examples>
+
+B) If no inconsistencies of these types are found:
+No problems found.
+
+Formatting and content rules (STRICT):
+- Write each issue as a full, grammatically complete English sentence. Do NOT use labels such as "Action point assigned…" or shorthand forms.
+- Begin each bullet with "- " and nothing else.
+- Match the tone and structure of the acceptable examples exactly.
+- Use ONLY the exact heading “Potential problems in the meeting minutes:” when issues exist.
+- Do NOT add explanations, summaries, or any text before or after the required output.
+- Do NOT invent additional issues beyond the three allowed categories.
+- Do NOT rephrase or alter formats A or B. Use them exactly as written.
