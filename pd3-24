@@ -1,0 +1,96 @@
+You are tasked with generating a structured project plan response that strictly follows the formatting style shown in the provided examples (Example_01, Example_02, Example_03). Your output must always match the formatting, spacing, tone, and structure demonstrated in those examples.
+
+GENERAL REQUIREMENTS:
+- Do not invent content not supported by the input.
+- Keep all wording concise and professional, similar to the examples.
+- Use bullet points (•) for lists, exactly as in the examples.
+- Do not bold or italicize any text. Do not use markdown formatting.
+- Do not output empty headers. Output a section only when input information logically requires it.
+- Dates must always follow the format: "June 1st 2025", "September 1st 2026", etc.
+- All dates should be aligned to quarterly cycle increments relative to the current date (Dec 3rd 2025). Subsequent phases should advance in quarterly steps (March 1st, June 1st, September 1st, December 1st).
+
+STRUCTURE RULES (MATCH EXACTLY AS IN EXAMPLES):
+
+1) TITLE  
+- If the input describes a project name directly, the Title equals that name.  
+- If the input instead describes a consulting context (e.g., service + emphasis), use the combined naming format as in Example_03.  
+- After the Title, insert exactly ONE empty line.
+
+2) INTRODUCTION (only when the input contains broader project context such as service/emphasis, stakeholders, budget, or strategic framing)  
+Format:  
+Introduction  
+Project Overview: <single concise sentence summarizing the project>  
+- No empty line between “Introduction” and “Project Overview: …”  
+- Insert ONE empty line after Project Overview.
+
+If the input does NOT justify an Introduction (e.g., input only gives Project + Key Phases), skip Introduction entirely.
+
+3) “Key Phases and Objectives” header  
+- Always include this header.  
+- Insert exactly ONE empty line after this header.
+
+4) PHASE SECTIONS  
+For each phase, follow this exact format:
+
+Phase X: <Phase Name>  
+Objective: <text on the SAME line after "Objective:">  
+Deliverables:
+• item  
+• item  
+
+Timeline:
+• Start Date: <quarterly date>  
+• End Date: <quarterly date>  
+
+Resources:
+• item  
+• item  
+
+SPACING RULES INSIDE PHASE:
+- NO empty line after "Objective:"  
+- ONE empty line before “Timeline:”  
+- ONE empty line before “Resources:”  
+- ONE empty line after Resources and before the next Phase (even though UI shows more vertical space, the correct underlying spacing is ONE line).
+
+5) OPTIONAL SECTIONS BASED ON INPUT  
+Include the following ONLY when input provides information that logically requires them:
+
+RISK MANAGEMENT  
+Assessment Phase Risks:
+• [risk]  
+• Mitigation: [action]
+
+Strategy Development Phase Risks:
+• [risk]  
+• Mitigation: [action]
+
+Implementation Phase Risks:
+• [risk]  
+• Mitigation: [action]
+
+STAKEHOLDER COMMUNICATION  
+Communication Plan:
+• item  
+• item  
+
+EVALUATION AND METRICS  
+Key Performance Indicators (KPIs):
+• item  
+• item  
+
+POST-IMPLEMENTATION EVALUATION  
+• One or two concise lines as in examples.
+
+SPACING FOR OPTIONAL SECTIONS:
+- ONE empty line before each of these major sections.
+- No extra blank lines inside lists beyond what examples show.
+
+6) DO NOT:
+- Add extra blank lines beyond what is explicitly defined above.
+- Add headings that do not exist in examples.
+- Change ordering of sections.
+- Overwrite or modify input meaning.
+
+The output must look structurally indistinguishable from the example responses when selected/highlighted.
+
+Now generate the response.
