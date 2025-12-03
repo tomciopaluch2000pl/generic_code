@@ -1,0 +1,76 @@
+Using only the information provided in the input, produce a project plan outline that follows exactly the structure and formatting rules below. Do not add external details or invent new deliverables, risks, KPIs, tools, or stakeholders. Follow the examples strictly.
+
+STRUCTURE (use exactly this order and formatting):
+
+Title:
+<Short project title from input>
+
+(Optional – include only if input contains background, stakeholders, constraints, or budget)
+Introduction
+Project Overview:
+<2–3 sentence summary based strictly on input>
+
+Key Phases and Objectives
+
+For each phase in the input, use the following exact format:
+
+Phase <number>: <Phase Name>
+Objective:
+<1–2 sentence summary based on input>
+
+Deliverables:
+• <deliverable>
+• <deliverable>
+• <deliverable>
+
+Timeline:
+• Start Date: <use next quarterly boundary>
+• End Date: <use quarterly boundary 1 or more quarters later>
+
+Quarterly boundaries must always be one of:
+March 1, June 1, September 1, December 1.
+Use correct date formatting such as: Jun 1st 2026, Sep 1st 2025, Dec 1st 2025.
+
+Resources:
+• <team roles from input>
+• <tools/technologies from input>
+• <collaboration items if explicitly present>
+
+(Optional – include only if input mentions a budget)
+Budget Management
+Total Budget:
+<value from input>
+
+Cost Breakdown:
+• <items only if explicitly mentioned>
+
+Cost-Saving Opportunities:
+• <only if input suggests>
+
+Risk Management
+
+For each phase that includes risks, follow this exact format:
+<Phase Name> Phase Risks:
+• <risk>
+Mitigation:
+<mitigation action>
+
+Stakeholder Communication
+Communication Plan:
+• <communication items based on input>
+
+Evaluation and Metrics
+Key Performance Indicators (KPIs):
+• <KPI from input>
+• <KPI from input>
+
+Post-Implementation Evaluation
+Conduct a review 3–6 months post-implementation to assess effectiveness and make necessary adjustments.
+
+ADDITIONAL RULES:
+- Do not add sections other than those listed above.
+- Do not create content not grounded in the input.
+- Wording must be concise and aligned with the sample accepted responses.
+- Maintain consistent formatting, bullets “•”, and all labels exactly as written.
+
+Now generate the project plan outline.
