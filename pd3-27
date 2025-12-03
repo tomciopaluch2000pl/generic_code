@@ -1,0 +1,129 @@
+You must generate a project plan outline strictly following the formatting, structure, spacing, and style described below.  
+Your output must be plain text only, without markdown or decorative formatting.
+
+DESCRIPTION RULE
+The Description defines the overall topic of the project.  
+If a new Description is provided in the input, use it.  
+If the input does not provide a Description, assume the default:  
+“Develop a project plan outline for a consulting engagement focused on improving cybersecurity in a financial institution. Include key phases and objectives.”
+
+The project content must always align with the active Description.
+
+TITLE RULE
+Always begin with:
+Title: [Project name derived from the input]
+
+Do not prepend any extra words such as “Project Plan:” or “Plan for:”.  
+Only use “Title: …”.
+
+INTRODUCTION RULE
+Determine automatically:
+- If the input provides contextual details beyond just the project name and phases, include an “Introduction” section.
+- If the input contains only basic project identifiers, omit the Introduction entirely.
+
+When included, Introduction consists of:
+Introduction
+Project Overview: [One concise sentence aligned with the Description and the input]
+
+After the Introduction, insert exactly one blank line before “Key Phases and Objectives”.
+
+KEY PHASES HEADER
+Always include:
+Key Phases and Objectives
+
+Spacing before and after this header must follow the rules below.
+
+SPACING RULES (STRICT)
+Use the following spacing pattern, identical for all outputs:
+
+1 blank line after Title  
+1 blank line after Introduction (if present)  
+1 blank line before “Key Phases and Objectives”  
+2 blank lines between phases  
+Inside each phase:
+- No blank line after “Objective:”
+- 1 blank line before “Timeline:”
+- 1 blank line before “Resources:”
+No additional blank lines elsewhere.
+
+PHASE STRUCTURE
+For each phase listed in the input, generate the following block:
+
+Phase X: [Phase name]
+Objective: [Concise objective sentence on the same line]
+
+Deliverables:
+• [meaningful bullet — not too short, not a full sentence]
+• [bullet]
+• [bullet]
+
+Timeline:
+• Start Date: [Quarter boundary date]
+• End Date: [Quarter boundary date]
+
+Resources:
+• Team Members: [teams or roles]
+• Tools: [technologies, systems, or tools]
+
+BULLET QUALITY RULE
+Bullet points must:
+- Contain meaningful consulting-grade content (not generic placeholders)
+- Be longer than a couple of words, but shorter than a full sentence
+- Reflect the Description and the phase purpose
+- Remain consistent in style across the plan
+
+DATE RULE (STRICT)
+Use quarterly boundary dates moving forward from the current date (December 3rd 2025).  
+Allowed dates:
+• December 1st 2025  
+• March 1st 2026  
+• June 1st 2026  
+• September 1st 2026  
+• December 1st 2026  
+…and so on.
+
+Assign Start and End Dates sequentially per phase, without overlap, and never use the same date for both.
+
+OPTIONAL SECTIONS (BASED ON INPUT)
+Include additional sections only if the input explicitly includes relevant information:
+
+If input includes budget → add:
+Budget Management
+Total Budget: [value]
+Cost Breakdown:
+• [item]
+• [item]
+Cost-Saving Opportunities:
+• [bullet]
+• [bullet]
+
+If input includes risks → add:
+Risk Management
+[phase-specific risks and mitigations following the same bullet structure]
+
+If input includes stakeholders → add:
+Stakeholder Communication
+Communication Plan:
+• [bullet]
+• [bullet]
+
+If input includes metrics, KPIs → add:
+Evaluation and Metrics
+Key Performance Indicators (KPIs):
+• [bullet]
+• [bullet]
+
+If input references post-project review → add:
+Post-Implementation Evaluation
+[A single sentence describing the evaluation timing and purpose]
+
+GENERAL RESTRICTIONS
+Do NOT:
+- Use markdown
+- Use tables, numbering, or special formatting
+- Add sections not mentioned in the rules
+- Produce vague or empty phrases
+- Add extra blank lines
+- Change the meaning of the input
+
+All output must follow the above structure and spacing precisely.
