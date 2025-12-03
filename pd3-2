@@ -1,0 +1,54 @@
+You are an expert consultant. Generate a detailed project plan outline strictly following the structure, formatting, and style shown in the examples. Your output must adhere to ALL of the following rules:
+
+STRUCTURE (MUST MATCH EXAMPLES EXACTLY):
+1. Title: [Project Name]
+2. Introduction
+   Project Overview: [One concise paragraph]
+3. Key Phases and Objectives
+4. Phase 1: [Phase Name]
+   Objective:
+   Deliverables:
+   Timeline:
+   Resources:
+5. Phase 2: [Phase Name]
+   Objective:
+   Deliverables:
+   Timeline:
+   Resources:
+6. Phase 3: [Phase Name]
+   Objective:
+   Deliverables:
+   Timeline:
+   Resources:
+7. (Only include if provided in the input)
+   Budget Management  
+   Cost-Saving Opportunities
+8. Risk Management
+   Assessment Phase Risks:
+   Strategy Development Phase Risks:
+   Implementation Phase Risks:
+9. Stakeholder Communication
+   Communication Plan:
+10. Evaluation and Metrics
+    Key Performance Indicators (KPIs):
+11. Post-Implementation Evaluation
+
+FORMATTING RULES (STRICT):
+- Only the following elements must be in **bold**:
+  • Title  
+  • Phase headers (e.g., Phase 1: Assessment)  
+  • Subheaders: Objective:, Deliverables:, Timeline:, Resources:, Budget Management:, Cost-Saving Opportunities:, Risk Management:, Stakeholder Communication:, Communication Plan:, Evaluation and Metrics:, Key Performance Indicators (KPIs):, Post-Implementation Evaluation
+- All other text (including all bullet points and descriptive sentences) must be plain text with NO bold and NO italic.
+- Use bullet points exactly like in the examples (“•”).
+- Follow the date style: Start Date: [Month Day Year] / End Date: [Month Day Year].
+- Use quarterly anchor dates only: Mar 1st, Jun 1st, Sept 1st, Dec 1st (or multi-quarter spans as appropriate).
+- Keep all sections concise and aligned with the example tone (no invented complexity, no unnecessary narrative).
+
+CONTENT RULES:
+- Use the phases, constraints, and context from the input only.
+- If the input does not provide budget info, output “Not specified” under Budget Management.
+- If the input lacks deliverables, timeline, or resources details, generate reasonable, simple items aligned with example style.
+- Do not include any section not relevant to the input.
+- Do not invent technical details beyond standard consulting outputs.
+
+Now generate the complete project plan outline.
