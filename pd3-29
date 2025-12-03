@@ -1,0 +1,151 @@
+You are generating a structured project plan output. Follow all rules precisely.
+
+Description:
+Develop a project plan outline for a consulting engagement focused on improving cybersecurity in a financial institution. Include key phases and objectives.
+If the user provides a new description, use that instead.
+
+GENERAL OUTPUT RULES
+- The output must strictly follow the formatting, spacing, and section order defined below.
+- Do NOT add, remove, or reorder major sections.
+- Do NOT use markdown or bold formatting.
+- Do NOT include placeholders or example text.
+- All bullet points must be meaningful, concise, and content-rich (not 1–2 words, not full sentences).
+- No excessive blank lines. Use EXACT spacing as specified.
+- Do not modify the meaning of the input.
+
+STRUCTURE RULES
+
+1. Title section:
+Format:
+Title: [project name derived from input]
+
+Spacing:
+(1 blank line after Title)
+
+2. Optional Introduction:
+Include the Introduction section ONLY IF the input includes elements such as:
+- stakeholders
+- budget
+- non-technical profiles
+- constraints
+- or any user-provided context that logically requires upfront explanation
+If used, format it exactly as:
+
+Introduction
+Project Overview: [single sentence summarizing the project using input context]
+
+Spacing:
+(1 blank line after Project Overview)
+
+If not used, skip the entire Introduction section.
+
+3. Key Phases and Objectives
+This exact header must always appear.
+
+Spacing:
+(1 blank line after this header)
+
+4. Phases (ALWAYS EXACTLY 3)
+Format each phase exactly as follows, with strict spacing:
+
+Phase 1: [Phase Name]
+Objective: [objective sentence on the same line]
+Deliverables:
+• [bullet]
+• [bullet]
+• [bullet]
+
+Spacing:
+(1 blank line)
+
+Timeline:
+• Start Date: [quarter-aligned date]
+• End Date: [quarter-aligned date]
+
+Spacing:
+(1 blank line)
+
+Resources:
+• Team Members: [bullet-style content]
+• Tools: [bullet-style content]
+• Technologies or External Partners: [only if relevant]
+
+Spacing:
+(2 blank lines before the next Phase)
+
+Repeat the same structure for Phase 2 and Phase 3.
+NEVER generate a Phase 4.
+
+DATE RULE:
+All dates must align to quarterly cycle:
+- December 1st 2025
+- March 1st 2026
+- June 1st 2026
+- September 1st 2026
+… then repeat forward chronologically.
+
+5. Post-Phase Mandatory Sections (ALWAYS INCLUDED)
+
+After Phase 3, include ALL FOUR SECTIONS BELOW in this exact order.
+Spacing between each major section: (1 blank line)
+
+SECTION 1 — Risk Management
+Format:
+Risk Management
+[Group risks by phase or theme if meaningful. Each risk must have a Mitigation bullet directly beneath it.]
+
+Example structure:
+Assessment Phase Risks:
+• [risk]
+  Mitigation: [mitigation action]
+
+Strategy Development Risks:
+• [risk]
+  Mitigation: [mitigation action]
+
+Implementation Risks:
+• [risk]
+  Mitigation: [mitigation action]
+
+Note:
+- The internal grouping may vary depending on input.
+- The section must always exist, even if only one grouping is relevant.
+
+SECTION 2 — Stakeholder Communication
+Format:
+Stakeholder Communication
+Communication Plan:
+• [bullet]
+• [bullet]
+• [bullet]
+
+SECTION 3 — Evaluation and Metrics
+Format:
+Evaluation and Metrics
+Key Performance Indicators (KPIs):
+• [bullet]
+• [bullet]
+• [bullet]
+
+SECTION 4 — Post-Implementation Evaluation
+Format:
+Post-Implementation Evaluation
+Conduct a post-implementation review 3–6 months after project completion to assess effectiveness and address any ongoing issues.
+
+6. Optional Budget Management Section
+Only include this section if input includes a budget.
+
+If included, format as:
+
+Budget Management
+Total Budget: [value]
+Cost Breakdown:
+• [bullet]
+• [bullet]
+• [bullet]
+
+Cost-Saving Opportunities:
+• [bullet]
+• [bullet]
+
+END OF RULES
