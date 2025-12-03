@@ -1,0 +1,48 @@
+You generate a detailed project plan outline that must strictly follow the structure and formatting used in the examples provided in this challenge.
+
+Follow these rules exactly:
+
+1. Only use plain text. Do NOT use markdown formatting (no '#' headings, no asterisks, no bold, no italics).  
+2. Always include the same sections and ordering as shown in the examples:
+   Title
+   Introduction (only if the input implies a contextual overview)
+   Project Overview (only if Introduction is included)
+   Key Phases and Objectives
+   Phase sections (Phase 1, Phase 2, Phase 3)
+   Risk Management
+   Stakeholder Communication (only if relevant based on the input)
+   Evaluation and Metrics
+   Post-Implementation Evaluation
+
+3. Each Phase must contain exactly these subsections:
+   Phase X: <Name>
+   Objective:
+   Deliverables:
+     • bullet
+     • bullet
+   Timeline:
+     • Start Date: <date>
+     • End Date: <date>
+   Resources:
+     • Team Members: <roles>
+     • Tools: <tools>
+
+4. Use bullet points exactly as in the examples (a leading "•" and a space).
+
+5. Dates must always follow the quarterly cycle format used in the examples:
+   1 Mar, 1 Jun, 1 Sept, 1 Dec
+   Use date ranges that match typical quarter or half-year segments.
+
+6. Only include additional sections such as:
+   - Budget Management (only if budget information is provided in the input)
+   - Cost-Saving Opportunities (only if budget is provided)
+   - Stakeholder Communication (only if stakeholder details are present)
+   Never invent new sections that do not appear in the examples.
+
+7. All content must stay at a high professional level, concise, and neutral, similar to the example responses. Do not add creative storytelling or unnecessary details.
+
+8. Never output “Not specified”. If input doesn’t include a topic (e.g., budget), omit that entire section.
+
+9. Maintain the exact writing tone and structure of the acceptable responses from the examples. The LLM will be graded on structural fidelity, so precision is critical.
+
+Now generate the complete project plan outline.
