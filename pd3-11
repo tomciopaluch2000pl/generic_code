@@ -1,0 +1,72 @@
+Generate a detailed project plan outline that strictly follows the structure, formatting, and wording style shown in the provided examples. Produce only the project plan outline.
+
+Follow these mandatory rules:
+
+1. Write all content in plain text. Do not use markdown, asterisks, hashtags, italics, or symbols not present in the examples.
+
+2. Use exactly the same section names, spacing, indentation, and bullet styling as in the examples. Headings must appear exactly as they do in example outputs:
+Title:
+Introduction
+Project Overview:
+Key Phases and Objectives
+Phase 1: Assessment
+Phase 2: Strategy Development
+Phase 3: Implementation
+Phase 3: Implementation and Integration (use only if the input clearly requires integration)
+Phase 3: Implementation and Training (use only if the input clearly requires training)
+Deliverables:
+Timeline:
+Resources:
+Risk Management
+Assessment Phase Risks:
+Strategy Development Phase Risks:
+Implementation Phase Risks:
+Stakeholder Communication
+Communication Plan:
+Evaluation and Metrics
+Key Performance Indicators (KPIs):
+Post-Implementation Evaluation
+Budget Management (include only if a budget is provided)
+Total Budget:
+Cost Breakdown:
+Cost-Saving Opportunities:
+
+3. Use bullet points exactly as in the examples.
+
+4. All content must be short, concise, and strictly limited to what the input provides. Do not invent details that are not supported by the input.
+
+5. Timeline dates must follow the quarterly cycle. Start dates can only be: 1 Mar, 1 Jun, 1 Sept, 1 Dec. End dates can only be: 1 Jun, 1 Sept, 1 Dec, 1 Mar. Dates must move forward sequentially and use the next appropriate year.
+
+6. Include only sections supported by the input. If the input does not mention budget, omit Budget Management. If the input does not mention integration, do not use “Implementation and Integration”. If the input does not mention training emphasis, do not use “Implementation and Training”.
+
+7. Do not write “Not specified”. If the input lacks information, omit that item entirely.
+
+8. Phase Objectives must be one concise sentence beginning with “Objective: Conduct…”, “Objective: Develop…”, or “Objective: Implement…”, depending on the phase.
+
+9. Maintain the exact order of sections found in the examples:
+Title
+Introduction
+Project Overview
+Key Phases and Objectives
+Phase 1
+Phase 2
+Phase 3
+Risk Management
+Stakeholder Communication
+Evaluation and Metrics
+Post-Implementation Evaluation
+
+10. For Risk Management, follow the exact structure from the examples:
+Assessment Phase Risks:
+• risk
+• Mitigation: action
+Strategy Development Phase Risks:
+• risk
+• Mitigation: action
+Implementation Phase Risks:
+• risk
+• Mitigation: action
+
+11. The final output must visually match the example responses in formatting, spacing, and ordering.
+
+Now generate the complete project plan outline.
