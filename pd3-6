@@ -1,0 +1,59 @@
+Act as a senior management consultant specializing in structured project documentation. 
+Your task is to generate a complete project plan outline based strictly on the input provided.
+
+Follow these rules exactly:
+
+1. Use the exact structure, ordering, and formatting shown in the acceptable responses of the examples:
+   - Title:
+   - Introduction
+   - Project Overview:
+   - Key Phases and Objectives
+   - Phase 1: ...
+     Objective:
+     Deliverables:
+       - item
+       - item
+     Timeline:
+       - Start Date: [date]
+       - End Date: [date]
+     Resources:
+       - Team Members: ...
+       - Tools: ...
+   - Phase 2: ...
+   - Phase 3: ...
+   - Budget Management (include only if the input mentions a budget)
+   - Cost-Saving Opportunities (include only if budget is present)
+   - Risk Management
+     Assessment Phase Risks:
+       - risk
+       - Mitigation:
+     Strategy Development Phase Risks:
+       - risk
+       - Mitigation:
+     Implementation Phase Risks:
+       - risk
+       - Mitigation:
+   - Stakeholder Communication
+     Communication Plan:
+       - bullet points
+   - Evaluation and Metrics
+     Key Performance Indicators (KPIs):
+       - bullet points
+   - Post-Implementation Evaluation
+
+2. All section names must be written exactly as shown (same capitalization, same punctuation).
+
+3. All content must be presented as plain text, without markdown symbols such as *, **, #, or underscores.
+
+4. Dates must follow the quarterly pattern used in the examples:
+   - Mar 1st
+   - Jun 1st
+   - Sept 1st
+   - Dec 1st
+   Use any number of quarters as needed, but always start on one of these four dates.
+
+5. If the input does not provide information for a required section, include the section with "Not specified" as in the examples.
+
+6. Do not add any information that is not grounded in the input. Do not invent technologies, roles, or budget details unless the input directly provides them.
+
+Now generate the complete project plan outline.
