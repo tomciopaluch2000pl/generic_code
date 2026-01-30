@@ -1,0 +1,209 @@
+BCM / DRP
+Legal Archive Hub
+1. Purpose and Scope
+
+Purpose
+This document describes the Business Continuity Management (BCM) and Disaster Recovery Plan (DRP) for the Legal Archive Hub solution.
+
+Scope
+The scope covers:
+
+Application layer
+
+Database layer
+
+Local system configuration
+
+Data persistence and backup
+
+External storage dependencies (HCP)
+
+The document applies to single-instance deployments running on IBM pSeries.
+
+2. System Overview
+2.1 Architecture Summary
+
+The Legal Archive Hub is deployed as a single-instance solution without geographical redundancy.
+
+Core components:
+
+Application: IBM CMOD 10.5
+
+Database: IBM DB2 (local instance)
+
+Operating System: AIX
+
+Platform: IBM pSeries (single LPAR)
+
+Archive Storage: Hitachi Vantara HCP (S3 protocol)
+
+2.2 High-Level Architecture Characteristics
+
+Single LPAR per environment
+
+No active-active or active-passive setup
+
+No secondary data center
+
+No automatic failover
+
+Disaster recovery is based on restore procedures, not site switch
+
+3. Business Continuity Management (BCM)
+3.1 BCM Strategy
+
+Business Continuity is limited by design.
+
+The Legal Archive Hub does not provide BCM in the classical sense, due to:
+
+Lack of a secondary site
+
+Single-instance architecture
+
+No real-time replication of application or database
+
+BCM approach:
+➡️ Recover service on the same site after incident resolution.
+
+3.2 Supported BCM Scenarios
+Scenario	BCM Coverage
+Application crash	Manual restart
+OS-level issue	Manual system recovery
+LPAR outage	Requires infrastructure recovery
+Site outage	Not supported
+3.3 BCM Limitations (Explicit Statement)
+
+The Legal Archive Hub does not support business continuity in the event of a full site outage.
+No alternative site or standby infrastructure is available.
+
+This limitation is known, accepted and documented.
+
+4. Disaster Recovery Plan (DRP)
+4.1 DRP Objectives
+
+The DRP focuses on:
+
+Recovering the application environment
+
+Restoring system configuration
+
+Restoring the database
+
+Re-establishing connectivity to archive storage
+
+4.2 Recovery Time Objectives (Indicative)
+Component	RTO
+OS / LPAR availability	Infrastructure dependent
+Application restore	2–4 hours
+Database restore	Depends on DB size
+Full service recovery	Same business day
+4.3 Recovery Point Objectives
+Component	RPO
+Database	Last successful DB2 backup
+Local configuration	Last filesystem backup
+Archived data (HCP)	Near-zero (platform managed)
+5. Backup Strategy
+5.1 Local System Backup
+
+The following local data must be backed up regularly:
+
+CMOD configuration files
+
+Application-specific directories
+
+OS-level configuration (if applicable)
+
+Scripts, certificates, keystores
+
+Backup type:
+
+File system level backup
+
+Scheduled, automated
+
+5.2 Database Backup (DB2)
+
+Full DB2 backups performed regularly
+
+Backup frequency aligned with business requirements
+
+Backups stored outside the LPAR (where possible)
+
+Restore dependency:
+
+DB2 binaries and version compatibility
+
+OS availability
+
+5.3 Archive Data (HCP)
+
+Archived content is NOT backed up at application level.
+
+Important clarification:
+
+All archived data is stored in HCP and benefits from HCP’s internal redundancy, durability and data protection mechanisms.
+
+6. External Dependencies
+6.1 Hitachi Content Platform (HCP)
+
+Used as archive storage via S3 protocol
+
+Provides:
+
+Data redundancy
+
+High durability
+
+Internal replication mechanisms
+
+Responsibility model:
+
+HCP availability, redundancy and data protection
+➡️ Owned and managed by the Storage Team
+
+Legal Archive Hub relies on HCP as an external service
+
+6.2 Responsibility Split
+Area	Responsibility
+Application	Application Team
+DB2 backups	Application / DB Team
+OS / LPAR	Infrastructure Team
+HCP platform	Storage Team
+7. Disaster Recovery Procedure (High-Level)
+
+Restore OS / LPAR (if required)
+
+Restore filesystem backups (CMOD configuration)
+
+Restore DB2 database from latest backup
+
+Validate application configuration
+
+Start CMOD services
+
+Verify connectivity to HCP
+
+Perform application-level validation
+
+8. Risks and Assumptions
+8.1 Key Risks
+
+Single point of failure (single LPAR)
+
+No site-level disaster protection
+
+Recovery dependent on infrastructure availability
+
+8.2 Assumptions
+
+HCP remains available during application recovery
+
+Storage Team ensures HCP durability and redundancy
+
+Backup jobs complete successfully and are monitored
+
+9. Summary (Executive-Friendly)
+
+The Legal Archive Hub is a single-instance archival solution without site redundancy.
+Business continuity is limited by architecture; disaster recovery is based on backup and restore procedures.
+Archived data is protected by the underlying HCP platform, which is managed by the Storage Team.
