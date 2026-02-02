@@ -3,7 +3,7 @@
 # Name      : db2_backup.sh
 # Subject   : Invoked by TSM to do a DB2 backup
 # Created   : TaHD LA Hub Team
-# Updated   : 2025-01-31
+# Updated   : 2026-01-31
 #           : ------------------------------------------------------------
 #           : If no argument is specified, the script exits with RC=255.
 #           : ------------------------------------------------------------
