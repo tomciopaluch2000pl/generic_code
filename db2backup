@@ -1,0 +1,163 @@
+#!/bin/ksh 
+###########################################################################################
+# Name      : db2_backup.sh
+# Subject   : Invoked by TSM to do a DB2 backup
+# Created   : TaHD LA Hub Team
+# Updated   : 2008-04-04
+#           : ------------------------------------------------------------
+#           : If no argument is specified, the script exits with RC=255.
+#           : ------------------------------------------------------------
+#           : $ 1 = backup type     : database_online | delete_obsolete 
+#           : $ 2 = instance name   : specify the DB2 Instance name
+#           : $ 3 = DB name         : Specify the DB2 DB name to backup 
+#           : $ 4 = retention       : only REQUIRED if you specified delete_obsolete 
+#           : ------------------------------------------------------------
+#           : ---------------------------------------------------------------------
+#           : -- refer to the specific stanza found in $DSMI_DIR/dsm.sys file.
+#           : ---------------------------------------------------------------------
+# IMPORTANT : Retention is managed by DB2 for database_online and by TSM for archive logs.
+#           : - you MUST set in DB2 environment DSMI_CONFIG variable to point to
+#           : - a specific dsm_DB2.opt in $DSMI_DIR, that then points to the good
+#           : - stanza in $DSMI_DIR/dsm.sys
+#           : - environment variables are set in the .profile of DB2 instance.
+#           : ---------------------------------------------------------------------
+#           : archive logs backup are launched internaly by DB2, after the management class
+#           : has been set by the DBA. Refer to the plug documentation for more info.
+###########################################################################################
+##########################################################
+# If the specified log directory doesn't exist, create it.
+##########################################################
+LOG=/exploit/logs/tsm/db2_backup_$1_$2_$3.log
+if [ ! -d /exploit/logs/tsm ]
+  then 
+    mkdir /exploit/logs/tsm ; chmod 766 /exploit/logs/tsm
+fi
+
+#####################
+# cycling log files.
+#####################
+mv $LOG.14 $LOG.15 2>/dev/null
+mv $LOG.13 $LOG.14 2>/dev/null
+mv $LOG.12 $LOG.13 2>/dev/null
+mv $LOG.11 $LOG.12 2>/dev/null
+mv $LOG.10 $LOG.11 2>/dev/null
+mv $LOG.9 $LOG.10 2>/dev/null
+mv $LOG.8 $LOG.9 2>/dev/null
+mv $LOG.7 $LOG.8 2>/dev/null
+mv $LOG.6 $LOG.7 2>/dev/null
+mv $LOG.5 $LOG.6 2>/dev/null
+mv $LOG.4 $LOG.5 2>/dev/null
+mv $LOG.3 $LOG.4 2>/dev/null
+mv $LOG.2 $LOG.3 2>/dev/null
+mv $LOG.1 $LOG.2 2>/dev/null
+mv $LOG $LOG.1 2>/dev/null
+
+exec 1> $LOG
+exec 2> $LOG
+
+#######################################
+# function to manage the syntax errors.
+#######################################
+function syntax {
+ echo " ################################################################################# "
+ echo " there is no argument to process or the arguments you gave are invalid. "
+ echo " You MUST specify the backup type / DB name & retention if needed. "
+ echo " exiting with return code 255... "
+ echo " -------------------------------------------------------------------------------- "
+ echo " Usage : "
+ echo "  - $ 1 =  Backup type     : database_online | delete_obsolete "
+ echo "  - $ 2 =  Instance name   : the name of the DB2 instance which contains the DB "
+ echo "  - $ 3 =  DB name         : the name of the DB2 DB to manage "
+ echo "  - $ 4 =  Retention       : only REQUIRED if you specify delete_obsolete "
+ echo " ################################################################################# "
+ exit 255
+}
+
+if [ $# -lt 3 ];then
+    syntax
+elif [ $1 = "delete_obsolete" ];then
+  if [ ! -n "$4" ];then
+    echo " You MUST specify the number of days if you want to do delete obsolete... "
+    syntax
+  fi
+fi
+
+###########################
+# Parameters and variables
+###########################
+BACKUP_TYPE=$1
+INSTANCE_NAME=$2
+DB_NAME=$3
+RETENTION_PERIOD=$4
+
+#DB2_USER is the INSTANCE_NAME specified as argument #2.
+#DB2_USER=$(ps -ef | grep -i ${DB_NAME} |grep -v root | awk '{ print $1 }' | sort -u)
+
+# DSMI_CONFIG & DSMI_DIR must be exported in the .profile file of the DB2 user.
+# You must check if DB2 is 32 bits or 64 bits before setting the environment variables.
+#export DSMI_CONFIG=${DSMI_DIR}/dsm_DB2.opt
+#export DSMI_DIR=${DSMI_DIR}
+
+echo " ################################################## "
+echo " ################################################## "
+echo " ################################################## "
+echo " --- Launching the DB2 JOB : --- "
+echo " --- BACKUP TYPE    = $BACKUP_TYPE " 
+echo " --- INSTANCE NAME  = $INSTANCE_NAME "
+echo " --- DB NAME        = $DB_NAME "
+echo " --- RETENTION      = $RETENTION_PERIOD "
+echo " --- (only applies if delete obsolete) "
+date
+echo " ############################################## "
+
+
+case "$BACKUP_TYPE" in
+  database_online|DATABASE_ONLINE)
+    echo " su - $INSTANCE_NAME -c db2 backup database ${DB_NAME} online use tsm open 1 sessions with 2 buffers buffer 1024 parallelism 2"
+    #su - $INSTANCE_NAME -c "db2 backup database ${DB_NAME} online use tsm open 1 sessions with 2 buffers buffer 1024 parallelism 2"
+    RC=$?
+    ;;
+  delete_obsolete|DELETE_OBSOLETE)
+    echo " su - $INSTANCE_NAME -c db2adutl delete full older than ${RETENTION_PERIOD} days database ${DB_NAME} without prompting "
+    su - $INSTANCE_NAME -c "db2adutl delete full older than ${RETENTION_PERIOD} days database ${DB_NAME} without prompting"
+    RC=$?
+    ;;
+  *)
+    echo "This is an unknown backup_type function for this script ..."
+    echo " exiting with return code 255. "
+    exit 255
+    ;;
+esac
+
+echo "\n"
+echo " ####################################################### "
+echo " getting some useful information .. "
+echo " ####################################################### " 
+echo "-------------------------------------------"
+echo " Some database information + Backup size .. "
+su - $INSTANCE_NAME -c "db2 connect to ${DB_NAME}"
+su - $INSTANCE_NAME -c "db2 list tablespaces show detail" | awk ' /Used pages|Page size/'\
+  | awk ' BEGIN {r=0} {u=$4;getline;r=r+($5*u)} END {print "Backup size is : " int(r/1024^2) " MB."} '
+su - $INSTANCE_NAME -c "db2 connect reset "
+echo "-------------------------------------------"
+echo " Obtain the management class used for Archive logs automatic backup to TSM : "
+su - $INSTANCE_NAME -c "db2 get db cfg for ${DB_NAME} | grep -i LOGARCHMETH1 "
+echo "-------------------------------------------"
+echo "List all full database backups available for DB2/TSM : "
+su - $INSTANCE_NAME -c "db2adutl query full DATABASE ${DB_NAME} "
+echo "\n"
+
+echo " ########################################################### "
+echo " --- End of DB2 JOB : --- "
+echo " --- BACKUP TYPE        = $BACKUP_TYPE " 
+echo " --- INSTANCE NAME      = $INSTANCE_NAME "
+echo " --- DB NAME            = $DB_NAME "
+echo " --- RETENTION          = $RETENTION_PERIOD "
+echo " --- (only applies if delete obsolete) "
+echo " --- RETURN CODE        = $RC " 
+echo " ... exiting with this return code ... "
+date
+echo " ########################################################### "
+
+echo "exit $RC "
+exit $RC
