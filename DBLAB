@@ -1,0 +1,208 @@
+# DB2 11.5 (AIX) — Lab backup/restore + activity documentation
+
+## Objective
+
+Build and document a repeatable lab process that validates:
+
+* DB2 database creation
+* tablespace and object creation
+* loading test data
+* **offline backup + offline restore**
+* **online full backup + restore + rollforward**
+* **online incremental backup (only changed tablespaces) + restore (full + incr) + rollforward**
+
+Target outcome: derive a production-ready approach for a large (~400 TB) DB2 database on AIX, considering backups to:
+
+* filesystem directory (with further transfer to HCP via S3)
+* comparison against IBM Spectrum Protect / TSM with Storage Agent (LAN-free / SAN)
+
+---
+
+## Assumptions and fixed decisions
+
+1. DB2 version: **11.5** on **AIX 7.2**.
+2. `LOGARCHMETH1` will point to a **separate filesystem from database data**.
+3. A small lab database is used to validate concepts before applying them to the large production database.
+4. The user provides **final working commands** from the environment (may differ from reference commands).
+5. This document is a **single source of truth** and will be updated incrementally (no rewriting of history).
+
+---
+
+## Key concepts
+
+### `LOGARCHMETH1` — what is stored there?
+
+* `LOGARCHMETH1` defines where DB2 stores **archived transaction logs**.
+* Archive logs contain **all database changes** (committed and uncommitted), including commit records.
+* During **rollforward**, DB2 automatically:
+
+  * reapplies committed transactions
+  * rolls back uncommitted transactions
+
+> These files are **not data backups**. They are required to make online and incremental backups usable.
+
+### Do we need to “manage” archive logs?
+
+* DB2 automatically generates and archives logs.
+* Operationally, you must:
+
+  * monitor filesystem space
+  * ensure retention (backup / offload to storage)
+  * prune logs safely using DB2 commands (`PRUNE LOGFILE`)
+* Without archive logs, **online and incremental backups cannot be restored**.
+
+---
+
+## Filesystem layout (to be finalized)
+
+* Database data: `TBD`
+* Active logs (`NEWLOGPATH`): `TBD`
+* Archive logs (`LOGARCHMETH1`): `TBD`
+* Backup images (filesystem): `TBD`
+
+---
+
+## Test scenario — step-by-step
+
+### Stage 0 — environment verification
+
+Validate DB2 version, instance, DBM/DB configuration and basic environment.
+
+**Reference commands (DB2 11.5, AIX 7.2):**
+
+```sh
+/opt/ibm/db2/V11.5/bin/db2level
+
+db2ilist
+db2 get instance
+
+printenv | egrep 'DB2INSTANCE|INSTHOME|PATH'
+
+db2 get dbm cfg | egrep -i 'DIAGPATH|SVCENAME|INTRA_PARALLEL|NUMDB'
+```
+
+**Final commands from environment:**
+
+```sh
+# to be provided by user
+```
+
+---
+
+### Stage 1 — database creation and log configuration
+
+* Create lab database
+* Configure active logs, archive logs and incremental tracking
+
+**Reference commands:**
+
+```sh
+export DBNAME=LABDB
+export DATA_PATH=/db2data
+export ACTIVELOG_PATH=/db2logs/${DBNAME}
+export ARCHLOG_PATH=/db2archlogs/${DBNAME}
+export BACKUP_PATH=/db2backup/${DBNAME}
+
+mkdir -p ${DATA_PATH} ${ACTIVELOG_PATH} ${ARCHLOG_PATH} ${BACKUP_PATH}
+
+db2 "CREATE DATABASE ${DBNAME} ON ${DATA_PATH} USING CODESET UTF-8 TERRITORY PL COLLATE USING SYSTEM"
+
+db2 "CONNECT TO ${DBNAME}"
+
+db2 "UPDATE DB CFG FOR ${DBNAME} USING NEWLOGPATH ${ACTIVELOG_PATH}"
+db2 "UPDATE DB CFG FOR ${DBNAME} USING LOGARCHMETH1 DISK:${ARCHLOG_PATH}"
+db2 "UPDATE DB CFG FOR ${DBNAME} USING TRACKMOD ON"
+
+db2 TERMINATE
+db2 "ACTIVATE DB ${DBNAME}"
+db2 "CONNECT TO ${DBNAME}"
+
+db2 "GET DB CFG FOR ${DBNAME}" | egrep -i 'NEWLOGPATH|LOGARCHMETH1|TRACKMOD|LOGFILSIZ|LOGPRIMARY|LOGSECOND'
+```
+
+**Final commands from environment:**
+
+```sh
+# to be provided by user
+```
+
+---
+
+### Stage 2 — tablespace creation
+
+Create tablespaces for application data.
+
+**Reference commands:**
+
+```sh
+db2 "CONNECT TO LABDB"
+
+db2 "CREATE TABLESPACE TS_DATA"
+
+# Optional:
+# db2 "CREATE TABLESPACE TS_IDX"
+
+# Validation
+db2 "LIST TABLESPACES SHOW DETAIL"
+```
+
+**Final commands from environment:**
+
+```sh
+# to be provided by user
+```
+
+---
+
+### Stage 3 — schema, table and test data
+
+Create schema, table and insert sample data.
+
+**Reference commands:**
+
+```sh
+db2 "CONNECT TO LABDB"
+
+db2 "CREATE SCHEMA APP"
+
+db2 "CREATE TABLE APP.TEST1 (
+  ID BIGINT NOT NULL PRIMARY KEY,
+  TXT VARCHAR(200),
+  CREATED_TS TIMESTAMP NOT NULL WITH DEFAULT CURRENT TIMESTAMP
+) IN TS_DATA"
+
+db2 "INSERT INTO APP.TEST1(ID, TXT) VALUES (1, 'hello')"
+db2 "INSERT INTO APP.TEST1(ID, TXT) VALUES (2, 'db2 lab')"
+db2 "COMMIT"
+
+db2 "SELECT * FROM APP.TEST1 ORDER BY ID"
+```
+
+**Final commands from environment:**
+
+```sh
+# to be provided by user
+```
+
+---
+
+## Change log
+
+* 2026-02-03: Project started. Defined backup/restore test flow (offline / online full / incremental).
+* 2026-02-03: Clarified role of `LOGARCHMETH1` and archive logs.
+* 2026-02-04: Document converted to English; stages 0–3 documented with DB2 11.5 / AIX 7.2 reference commands.
+
+---
+
+## Command log
+
+> Final working commands from the environment will be copied here as the authoritative reference.
+
+---
+
+## Open questions / risks
+
+* Final filesystem layout and throughput (filesystem → HCP S3).
+* Archive log retention and pruning policy.
+* Restore on same host vs different host (RTO/RPO implications).
+* Performance comparison: filesystem backup vs TSM (LAN-free).
