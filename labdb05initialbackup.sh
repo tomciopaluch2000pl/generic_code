@@ -1,0 +1,3 @@
+export LABDB=ODLLAB1
+
+db2 "BACKUP DATABASE ${LABDB} TO /ars/data/backup/${LABDB} COMPRESS"
