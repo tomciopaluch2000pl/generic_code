@@ -1,0 +1,122 @@
+Step 8 — Prepare / reset STAGING database (KSLAB1_STG)
+
+8.1 Ensure STAGING DB exists (create if missing)
+
+If you already created it earlier, skip the create and just drop+create fresh.
+
+db2 deactivate db KSLAB1_STG >/dev/null 2>&1 || true
+db2 drop db KSLAB1_STG >/dev/null 2>&1 || true
+db2 create db KSLAB1_STG using codeset UTF-8 territory us
+
+8.2 Put STAGING into archive logging too (recommended for clean rollforward behavior)
+
+db2 connect to KSLAB1_STG
+db2 "UPDATE DB CFG FOR KSLAB1_STG USING LOGARCHMETH1 DISK:/ars/home/kslab/arch/KSLAB1_STG/archive"
+db2 "UPDATE DB CFG FOR KSLAB1_STG USING NEWLOGPATH /ars/home/kslab/arch/KSLAB1_STG/active"
+db2 "UPDATE DB CFG FOR KSLAB1_STG USING TRACKMOD YES"
+db2 connect reset
+
+Now force cfg changes to apply (deactivate/activate is enough):
+
+db2 deactivate db KSLAB1_STG >/dev/null 2>&1 || true
+db2 activate db KSLAB1_STG
+db2 deactivate db KSLAB1_STG
+
+Step 9 — Restore ONLY TS2 into STAGING (redirected restore)
+
+9.1 Restore TS2 from ONLINE FULL (timestamp 20260217102911)
+
+We restore into KSLAB1_STG, but we must tell DB2 to restore tablespace TS2 only.
+
+db2 "RESTORE DATABASE KSLAB1 INTO KSLAB1_STG FROM '/ars/home/kslab/backup/full/tgt1','/ars/home/kslab/backup/full/tgt2' TAKEN AT 20260217102911 TABLESPACE (TS2) REDIRECT WITHOUT ROLLING FORWARD"
+
+Expected: restore goes into restore pending and awaits container redirection.
+
+9.2 Redirect TS2 container to STAGING path
+
+We must map TS2’s container to a different directory so it doesn’t overwrite source.
+
+Create container directory:
+
+mkdir -p /ars/home/kslab/data/KSLAB1_STG/ts2
+
+Set TS2 containers (TBSPACEID for TS2 = 5):
+
+db2 "SET TABLESPACE CONTAINERS FOR 5 USING (FILE '/ars/home/kslab/data/KSLAB1_STG/ts2/ts2.cont' 2000)"
+
+Continue restore:
+
+db2 "RESTORE DATABASE KSLAB1 INTO KSLAB1_STG CONTINUE"
+
+Step 10 — Apply INCREMENTAL backup to TS2 in STAGING (timestamp 20260217103901)
+
+db2 "RESTORE DATABASE KSLAB1 INTO KSLAB1_STG FROM '/ars/home/kslab/backup/inc/tgt1','/ars/home/kslab/backup/inc/tgt2' TAKEN AT 20260217103901 INCREMENTAL TABLESPACE (TS2) WITHOUT ROLLING FORWARD"
+
+(If DB2 complains about needing REDIRECT again: re-issue the SET TABLESPACE CONTAINERS FOR 5 ... then RESTORE ... CONTINUE.)
+
+Step 11 — Rollforward STAGING to PIT (before delete)
+
+Your PIT timestamp: 2026-02-17-10.47.03
+
+db2 "ROLLFORWARD DATABASE KSLAB1_STG TO '2026-02-17-10.47.03' AND STOP"
+db2 "ROLLFORWARD DATABASE KSLAB1_STG COMPLETE"
+
+Now STAGING should be consistent at that PIT.
+
+⸻
+
+Step 12 — Verify row 12 exists in STAGING
+
+db2 connect to KSLAB1_STG
+db2 "SELECT * FROM T_TS2 ORDER BY ID"
+db2 "SELECT * FROM T_TS2 WHERE ID=12"
+
+You should see 10,11,12,13 in STAGING.
+
+Step 13 — Copy recovered row 12 back into SOURCE (KSLAB1)
+
+13.1 Extract row 12 value + timestamp from STAGING (manual copy is simplest)
+
+Run this and copy output:
+
+db2 "SELECT ID, VAL, TS FROM T_TS2 WHERE ID=12"
+
+13.2 Insert into SOURCE (avoid duplicates)
+
+db2 connect reset
+db2 connect to KSLAB1
+db2 "INSERT INTO T_TS2 (ID,VAL,TS) SELECT ID,VAL,TS FROM KSLAB1_STG.T_TS2 WHERE ID=12"
+db2 "COMMIT"
+db2 "SELECT * FROM T_TS2 ORDER BY ID"
+db2 connect reset
+
+Result in SOURCE should now be: 10,11,12,13
+
+If the cross-db SELECT fails
+
+Some environments don’t allow KSLAB1_STG.T_TS2 reference directly.
+
+Then do this instead (always works):
+
+Export from STAGING
+
+db2 connect to KSLAB1_STG
+db2 "EXPORT TO /ars/home/kslab/tmp/ts2_id12.del OF DEL SELECT ID,VAL,TS FROM T_TS2 WHERE ID=12"
+db2 connect reset
+
+Import into SOURCE
+
+db2 connect to KSLAB1
+db2 "IMPORT FROM /ars/home/kslab/tmp/ts2_id12.del OF DEL INSERT INTO T_TS2"
+db2 "COMMIT"
+db2 "SELECT * FROM T_TS2 ORDER BY ID"
+db2 connect reset
+
+I need from you after Step 9
+
+Send a screenshot (or paste output) for:
+	1.	The first RESTORE ... TABLESPACE (TS2) REDIRECT ... completion / messages
+	2.	SET TABLESPACE CONTAINERS... + RESTORE ... CONTINUE
+	3.	Any restore/rollforward errors (if they appear)
+
+Then we’ll fine-tune the exact restore/rollforward flow if your DB2 level asks for a slightly different restore clause order.
