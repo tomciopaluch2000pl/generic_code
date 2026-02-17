@@ -1,0 +1,31 @@
+Step 2 — Create TS1/TS2/TS3 + tables (single-line SQL)
+
+2.1 Connect
+
+db2 connect to KSLAB1
+
+2.2 Create tablespaces (each statement is one line)
+
+db2 "CREATE TABLESPACE TS1 MANAGED BY DATABASE USING (FILE '/ars/home/kslab/data/KSLAB1/ts1/ts1.cont' 2000M) EXTENTSIZE 32 PREFETCHSIZE 64 BUFFERPOOL IBMDEFAULTBP"
+db2 "CREATE TABLESPACE TS2 MANAGED BY DATABASE USING (FILE '/ars/home/kslab/data/KSLAB1/ts2/ts2.cont' 2000M) EXTENTSIZE 32 PREFETCHSIZE 64 BUFFERPOOL IBMDEFAULTBP"
+db2 "CREATE TABLESPACE TS3 MANAGED BY DATABASE USING (FILE '/ars/home/kslab/data/KSLAB1/ts3/ts3.cont' 2000M) EXTENTSIZE 32 PREFETCHSIZE 64 BUFFERPOOL IBMDEFAULTBP"
+
+2.3 Create one table per tablespace (one line each)
+
+db2 "CREATE TABLE T_TS1 (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(100), TS TIMESTAMP) IN TS1"
+db2 "CREATE TABLE T_TS2 (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(100), TS TIMESTAMP) IN TS2"
+db2 "CREATE TABLE T_TS3 (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(100), TS TIMESTAMP) IN TS3"
+
+2.4 Verify tablespaces + tables (single-line queries)
+
+db2 "SELECT tbsp_name, tbsp_id, type FROM syscat.tablespaces WHERE tbsp_name IN ('TS1','TS2','TS3')"
+db2 "SELECT tabname, tbspace FROM syscat.tables WHERE tabname IN ('T_TS1','T_TS2','T_TS3')"
+
+2.5 Disconnect
+
+db2 connect reset
+
+After that
+
+db2 "select tbsp_name, tbsp_id from syscat.tablespaces where tbsp_name like 'TS%'"
+
