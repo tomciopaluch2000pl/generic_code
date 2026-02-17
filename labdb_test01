@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# DB2 11.5 (AIX 7.2) - Performance-focused backup + tablespace-level restore strategy
+# Scenario: restore a "lost" row by rebuilding a TABLESPACE in a separate STAGING DB
+#           using FULL + INCREMENTAL ONLINE backups + LOGS, then PIT rollforward
+#
+# Goal:
+# - Keep PROD online
+# - After accidental DELETE in one tablespace, reconstruct data via STAGING restore
+# - Export the missing row(s) from STAGING and insert back into PROD
+#
+# Notes (performance + correctness):
+# - ONLINE backup requires ARCHIVE LOG mode (LOGARCHMETH1 not OFF)
+# - INCLUDE LOGS simplifies recovery (no log hunting)
+# - For speed, use multiple backup target directories + PARALLELISM/BUFFER tuning
+# - Tablespace-level restore in PROD typically still needs rollforward; for 400TB,
+#   the operational pattern is: restore into STAGING, extract needed data, reapply.
+# ==============================================================================
+
+set -euo pipefail
+
+# -----------------------------
+# Adjust these paths if needed
+# -----------------------------
+SRCDB="LABSRC"
+STGDB="LABSTG"
+BACKUPROOT="/backup/db2lab"
+BKPFULL="${BACKUPROOT}/full"
+BKPINC="${BACKUPROOT}/inc"
+ARCHROOT="/db2arch/${SRCDB}"              # archive log location (disk example)
+
+# Multiple backup targets for better throughput (parallel I/O)
+BKP_TGT1="${BKPFULL}/tgt1"
+BKP_TGT2="${BKPFULL}/tgt2"
+BKP_TGT3="${BKPINC}/tgt1"
+BKP_TGT4="${BKPINC}/tgt2"
+
+# Tablespace container roots (separate FS improves performance)
+TSROOT="/db2data/${SRCDB}"
+TS1PATH="${TSROOT}/ts1"
+TS2PATH="${TSROOT}/ts2"
+TS3PATH="${TSROOT}/ts3"
+
+# Staging restore paths (separate from PROD paths)
+STGROOT="/db2data/${STGDB}"
+STGTS1="${STGROOT}/ts1"
+STGTS2="${STGROOT}/ts2"
+STGTS3="${STGROOT}/ts3"
+
+# Backup performance knobs (tune per environment)
+PARALLELISM=4
+NUMBUFFERS=4
+BUFFERPAGES=2048   # 2048 x 4KB = 8MB per buffer (depends on page size)
+
+mkdir -p "${BKP_TGT1}" "${BKP_TGT2}" "${BKP_TGT3}" "${BKP_TGT4}"
+mkdir -p "${ARCHROOT}"
+mkdir -p "${TS1PATH}" "${TS2PATH}" "${TS3PATH}"
+mkdir -p "${STGTS1}" "${STGTS2}" "${STGTS3}"
+
+echo "=== 0) Pre-check: DB2 instance and archive logging requirement ==="
+# (Optional) verify you are in correct instance
+db2level
+
+# If DB already exists, clean up from previous runs (safe for lab)
+echo "=== 1) Drop existing lab DBs (ignore errors if they don't exist) ==="
+db2 "deactivate db ${SRCDB}" >/dev/null 2>&1 || true
+db2 "deactivate db ${STGDB}" >/dev/null 2>&1 || true
+db2 "drop db ${SRCDB}"       >/dev/null 2>&1 || true
+db2 "drop db ${STGDB}"       >/dev/null 2>&1 || true
+
+echo "=== 2) Create source DB (PROD-like) and enable ARCHIVE logging ==="
+db2 "create db ${SRCDB} using codeset UTF-8 territory US"
+db2 "connect to ${SRCDB}"
+
+# Enable archive logging (ONLINE backup prerequisite)
+# NOTE: LOGARCHMETH1 can be DISK:/path, TSM, VENDOR, etc. Here: DISK
+db2 "update db cfg for ${SRCDB} using LOGARCHMETH1 DISK:${ARCHROOT}"
+
+# Recommended for log performance (adjust sizes per lab)
+db2 "update db cfg for ${SRCDB} using LOGFILSIZ 8192"
+db2 "update db cfg for ${SRCDB} using LOGPRIMARY 20"
+db2 "update db cfg for ${SRCDB} using LOGSECOND 40"
+db2 "update db cfg for ${SRCDB} using NEWLOGPATH ${ARCHROOT}/active"
+
+db2 "connect reset"
+db2stop
+db2start
+
+echo "=== 3) Create 3 dedicated tablespaces (one per container path) ==="
+db2 "connect to ${SRCDB}"
+
+# DMS tablespaces with FILE containers (clear mapping to disks; good for lab)
+# Use 32K page size only if you need it; default 4K is fine for this scenario.
+db2 -tv <<SQL
+-- Create three DMS tablespaces (each in its own filesystem path)
+CREATE TABLESPACE TS1 MANAGED BY DATABASE
+  USING (FILE '${TS1PATH}/ts1.cont' 2000M)
+  EXTENTSIZE 32
+  PREFETCHSIZE 64
+  BUFFERPOOL IBMDEFAULTBP;
+
+CREATE TABLESPACE TS2 MANAGED BY DATABASE
+  USING (FILE '${TS2PATH}/ts2.cont' 2000M)
+  EXTENTSIZE 32
+  PREFETCHSIZE 64
+  BUFFERPOOL IBMDEFAULTBP;
+
+CREATE TABLESPACE TS3 MANAGED BY DATABASE
+  USING (FILE '${TS3PATH}/ts3.cont' 2000M)
+  EXTENTSIZE 32
+  PREFETCHSIZE 64
+  BUFFERPOOL IBMDEFAULTBP;
+
+-- Create one table per tablespace so we can clearly target recovery by TS
+CREATE TABLE T_TS1 (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(100), TS TIMESTAMP)
+  IN TS1;
+
+CREATE TABLE T_TS2 (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(100), TS TIMESTAMP)
+  IN TS2;
+
+CREATE TABLE T_TS3 (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(100), TS TIMESTAMP)
+  IN TS3;
+SQL
+
+echo "=== 4) Seed each tablespace with rows (baseline) ==="
+db2 -tv <<SQL
+INSERT INTO T_TS1 VALUES (1, 'ts1-row-1', CURRENT TIMESTAMP);
+INSERT INTO T_TS1 VALUES (2, 'ts1-row-2', CURRENT TIMESTAMP);
+
+INSERT INTO T_TS2 VALUES (10, 'ts2-row-10', CURRENT TIMESTAMP);
+INSERT INTO T_TS2 VALUES (11, 'ts2-row-11', CURRENT TIMESTAMP);
+
+INSERT INTO T_TS3 VALUES (20, 'ts3-row-20', CURRENT TIMESTAMP);
+INSERT INTO T_TS3 VALUES (21, 'ts3-row-21', CURRENT TIMESTAMP);
+
+COMMIT;
+
+-- Quick check
+SELECT 'TS1' AS TS, COUNT(*) AS CNT FROM T_TS1
+UNION ALL SELECT 'TS2', COUNT(*) FROM T_TS2
+UNION ALL SELECT 'TS3', COUNT(*) FROM T_TS3;
+SQL
+
+echo "=== 5) Take an ONLINE FULL backup (INCLUDE LOGS) - performance oriented ==="
+# MULTIPLE targets => DB2 can write in parallel; improves throughput
+# PARALLELISM/NUMBUFFERS/BUFFER => improve backup I/O pipeline (tune)
+db2 "backup db ${SRCDB} online to ${BKP_TGT1}, ${BKP_TGT2} compress include logs \
+     parallelism ${PARALLELISM} num_buffers ${NUMBUFFERS} buffer ${BUFFERPAGES}"
+
+echo "=== 6) Add more rows to each tablespace (after full backup) ==="
+db2 -tv <<SQL
+INSERT INTO T_TS1 VALUES (3, 'ts1-row-3-afterfull', CURRENT TIMESTAMP);
+INSERT INTO T_TS2 VALUES (12, 'ts2-row-12-afterfull', CURRENT TIMESTAMP);
+INSERT INTO T_TS3 VALUES (22, 'ts3-row-22-afterfull', CURRENT TIMESTAMP);
+COMMIT;
+SQL
+
+echo "=== 7) Take ONLINE INCREMENTAL backup (INCLUDE LOGS) ==="
+# NOTE: requires TRACKMOD=YES (default in most modern DB2 setups). If not, set it:
+# db2 "update db cfg for ${SRCDB} using TRACKMOD YES"
+db2 "backup db ${SRCDB} online incremental to ${BKP_TGT3}, ${BKP_TGT4} compress include logs \
+     parallelism ${PARALLELISM} num_buffers ${NUMBUFFERS} buffer ${BUFFERPAGES}"
+
+echo "=== 8) Create a PIT marker timestamp (we will rollforward STAGING to before DELETE) ==="
+# We capture a timestamp BEFORE we do the accidental delete.
+# We'll later rollforward STAGING to this time (or a second before delete).
+PIT_TS=$(db2 -x "connect to ${SRCDB}; values varchar_format(current timestamp, 'YYYY-MM-DD-HH24.MI.SS'); connect reset;" | tr -d ' ')
+echo "PIT target timestamp (before delete) = ${PIT_TS}"
+
+echo "=== 9) Post-increment changes: add rows in 2 tablespaces, then DELETE 1 row in TS2 (incident) ==="
+db2 "connect to ${SRCDB}"
+
+db2 -tv <<SQL
+-- Additional inserts after the incremental backup (these will exist in logs only)
+INSERT INTO T_TS1 VALUES (4, 'ts1-row-4-afterinc', CURRENT TIMESTAMP);
+INSERT INTO T_TS3 VALUES (23, 'ts3-row-23-afterinc', CURRENT TIMESTAMP);
+COMMIT;
+
+-- INCIDENT: delete a row in TS2 which we want to recover (e.g., ID=11)
+DELETE FROM T_TS2 WHERE ID = 11;
+COMMIT;
+
+-- Verify the row is gone in PROD
+SELECT * FROM T_TS2 ORDER BY ID;
+SQL
+
+db2 "connect reset"
+
+# ==============================================================================
+# STAGING RESTORE PHASE
+# Strategy:
+# - Restore the DB into STAGING from the FULL backup, then apply INCREMENTAL
+# - Rollforward STAGING to PIT timestamp (before delete) so the deleted row exists
+# - Export the recovered row(s) from STAGING and reinsert into PROD
+#
+# Key point:
+# - We are not restoring anything in PROD (keeps PROD online).
+# - We use STAGING as the "recovery sandbox".
+# ==============================================================================
+
+echo "=== 10) Restore FULL backup into STAGING DB name (redirected restore) ==="
+
+# Restore from FULL backup image into new DB name
+# Use WITHOUT ROLLING FORWARD so we can apply incrementals/logs explicitly
+db2 "restore db ${SRCDB} from ${BKP_TGT1} taken at $(db2 -x "list history backup all for ${SRCDB} | awk '/Backup/ && /Online/ {print \$1; exit}'" 2>/dev/null || true) \
+     into ${STGDB} redirect generate script restore_redirect.sql" || true
+
+# If the auto-timestamp extraction above doesn't work in your lab, do this manually:
+#   db2 "list history backup all for ${SRCDB}"
+# find the FULL backup "taken at" timestamp, then run:
+#   db2 "restore db ${SRCDB} from ${BKP_TGT1} taken at <YYYYMMDDHHMMSS> into ${STGDB} redirect generate script restore_redirect.sql"
+
+echo "=== 10a) Edit restore_redirect.sql to point containers to STAGING paths, then run it ==="
+cat <<'HINT'
+MANUAL STEP (one-time):
+1) Open restore_redirect.sql and replace container paths:
+   - /db2data/LABSRC/ts1/...  -> /db2data/LABSTG/ts1/...
+   - /db2data/LABSRC/ts2/...  -> /db2data/LABSTG/ts2/...
+   - /db2data/LABSRC/ts3/...  -> /db2data/LABSTG/ts3/...
+
+2) Then execute:
+   db2 -tvf restore_redirect.sql
+
+If you prefer fully automated path mapping, we can use db2 "set tablespace containers for ..." statements.
+HINT
+
+echo "=== 11) Apply INCREMENTAL backup to STAGING ==="
+# Same note: if you didn’t generate/execute restore script yet, do that first.
+# Now restore incremental image into STAGING:
+#   db2 "restore db ${STGDB} incremental from <inc_path> taken at <inc_ts> into ${STGDB}"
+
+echo "ACTION REQUIRED (likely manual): find incremental 'taken at' timestamp"
+echo "Run: db2 \"list history backup all for ${SRCDB}\""
+echo "Then run: db2 \"restore db ${STGDB} incremental from ${BKP_TGT3} taken at <INC_TAKEN_AT> into ${STGDB}\""
+
+cat <<'EXAMPLE'
+Example command (fill INC_TAKEN_AT):
+db2 "restore db LABSTG incremental from /backup/db2lab/inc/tgt1 taken at 20260217123000 into LABSTG"
+EXAMPLE
+
+echo "=== 12) Rollforward STAGING to PIT timestamp (before delete) ==="
+# Rollforward will apply logs included with backups and/or archived logs.
+# We stop at PIT_TS to ensure the deleted row is present.
+cat <<EXAMPLE2
+After incremental restore completes, run:
+
+db2 "rollforward db ${STGDB} to ${PIT_TS} using local time and stop"
+
+Then verify:
+db2 "connect to ${STGDB}"
+db2 "select * from T_TS2 where ID=11"
+db2 "connect reset"
+EXAMPLE2
+
+echo "=== 13) Export the recovered row from STAGING and reinsert into PROD ==="
+cat <<'EXAMPLE3'
+# Export the row (or rows) from STAGING
+db2 "connect to LABSTG"
+db2 "export to /tmp/recovered_ts2_id11.del of del select * from T_TS2 where ID=11"
+db2 "connect reset"
+
+# Insert back into PROD (LABSRC)
+db2 "connect to LABSRC"
+db2 "import from /tmp/recovered_ts2_id11.del of del insert into T_TS2"
+db2 "commit"
+db2 "select * from T_TS2 order by ID"
+db2 "connect reset"
+EXAMPLE3
+
+echo "=== 14) Optional: show history + rollforward status (useful for troubleshooting) ==="
+cat <<'DIAG'
+# History (backup images and timestamps)
+db2 "list history backup all for LABSRC"
+
+# Rollforward pending status
+db2 "rollforward db LABSTG query status"
+DIAG
+
+echo "=== DONE (lab flow prepared) ==="
+echo "PIT timestamp used: ${PIT_TS}"
+echo "If you want, I can provide a version that avoids the manual edit of restore_redirect.sql by using explicit 'SET TABLESPACE CONTAINERS' statements."
