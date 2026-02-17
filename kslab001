@@ -1,3 +1,5 @@
+1.1 Create lab directories (no root needed)
+
 export SRCDB=KSLAB1
 export STGDB=KSLAB1_STG
 export LABROOT=/ars/home/kslab
@@ -19,3 +21,40 @@ mkdir -p $LABROOT/data/$STGDB/ts2
 mkdir -p $LABROOT/data/$STGDB/ts3
 
 ls -ld $LABROOT $LABROOT/backup $LABROOT/arch $LABROOT/data
+
+1.2 Drop old lab DBs if they exist (safe)
+
+db2 deactivate db $SRCDB >/dev/null 2>&1 || true
+db2 deactivate db $STGDB >/dev/null 2>&1 || true
+db2 drop db $SRCDB >/dev/null 2>&1 || true
+db2 drop db $STGDB >/dev/null 2>&1 || true
+
+1.3 Create SOURCE DB
+
+db2 create db $SRCDB using codeset UTF-8 territory US
+
+1.4 Enable ONLINE + INCREMENTAL prerequisites (archive logs + trackmod)
+
+db2 connect to $SRCDB
+
+db2 update db cfg for $SRCDB using LOGARCHMETH1 DISK:$LABROOT/arch/$SRCDB/archive
+db2 update db cfg for $SRCDB using NEWLOGPATH $LABROOT/arch/$SRCDB/active
+db2 update db cfg for $SRCDB using TRACKMOD YES
+
+# reasonable lab defaults (we can tune later)
+db2 update db cfg for $SRCDB using LOGFILSIZ 8192
+db2 update db cfg for $SRCDB using LOGPRIMARY 20
+db2 update db cfg for $SRCDB using LOGSECOND 40
+
+db2 connect reset
+db2stop
+db2start
+
+1.5 Verify configuration (send screenshot of this output)
+
+db2 get db cfg for $SRCDB | egrep -i "Database path|LOGARCHMETH1|NEWLOGPATH|TRACKMOD"
+
+Expected:
+	•	LOGARCHMETH1 shows DISK:/ars/home/kslab/arch/KSLAB1/archive
+	•	NEWLOGPATH shows /ars/home/kslab/arch/KSLAB1/active
+	•	TRACKMOD YES
