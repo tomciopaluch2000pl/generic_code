@@ -1,0 +1,33 @@
+Step 7 (Controlled incident) + Step 8 (tablespace recovery plan trigger)
+
+Step 7.1 — Add some more rows (so we have “after incremental” activity)
+
+db2 connect to KSLAB1
+db2 "INSERT INTO T_TS1 VALUES (4,'ts1_row4_after_inc',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS2 VALUES (13,'ts2_row13_after_inc',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS3 VALUES (23,'ts3_row23_after_inc',CURRENT TIMESTAMP)"
+db2 "COMMIT"
+
+Step 7.2 — Capture PIT timestamp automatically (right before DELETE)
+
+This is the timestamp we’ll rollforward TO in STAGING:
+
+db2 -x "VALUES VARCHAR_FORMAT(CURRENT TIMESTAMP,'YYYY-MM-DD-HH24.MI.SS')" | tr -d ' '
+
+Copy the output (example format: 2026-02-17-10.45.12).
+
+Step 7.3 — DELETE incident in TS2 (remove the row we want back)
+
+Let’s delete the “after_full” row in TS2 so we can prove recovery:
+
+db2 "DELETE FROM T_TS2 WHERE ID = 12"
+db2 "COMMIT"
+db2 "SELECT * FROM T_TS2 ORDER BY ID"
+
+Once you paste the PIT timestamp output + the SELECT * FROM T_TS2, we move to:
+	•	create KSLAB1_STG
+	•	restore TS2 only from FULL + INCREMENTAL into STAGING (redirect containers)
+	•	rollforward STAGING to the PIT timestamp
+	•	export recovered row(s) and insert back into source DB
+
+Send the PIT timestamp + TS2 select and we continue.
