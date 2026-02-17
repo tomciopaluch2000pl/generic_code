@@ -1,0 +1,31 @@
+Step 5 — Add rows after FULL (to all tablespaces)
+
+Connect and add a few rows (single-line commands):
+
+db2 connect to KSLAB1
+db2 "INSERT INTO T_TS1 VALUES (3,'ts1_row3_after_full',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS2 VALUES (12,'ts2_row12_after_full',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS3 VALUES (22,'ts3_row22_after_full',CURRENT TIMESTAMP)"
+db2 "COMMIT"
+
+Verify counts:
+
+db2 "SELECT 'TS1' AS TS, COUNT(*) AS CNT FROM T_TS1"
+db2 "SELECT 'TS2' AS TS, COUNT(*) AS CNT FROM T_TS2"
+db2 "SELECT 'TS3' AS TS, COUNT(*) AS CNT FROM T_TS3"
+
+Step 6 — ONLINE INCREMENTAL Backup + INCLUDE LOGS (performance)
+
+Use same pattern, but add INCREMENTAL:
+
+db2 "BACKUP DATABASE KSLAB1 ONLINE INCREMENTAL TO '/ars/home/kslab/backup/inc/tgt1','/ars/home/kslab/backup/inc/tgt2' WITH 2 BUFFERS BUFFER 1024 PARALLELISM 2 COMPRESS INCLUDE LOGS"
+
+After it succeeds:
+
+db2 "LIST HISTORY BACKUP ALL FOR KSLAB1"
+
+1.	LIST HISTORY... after FULL (so we capture entry cleanly)
+	2.	counts after Step 5
+	3.	incremental backup success + history
+
+Then we do the incident (DELETE in TS2), capture PIT, and recover TS2 via STAGING.
