@@ -1,0 +1,21 @@
+export SRCDB=KSLAB1
+export STGDB=KSLAB1_STG
+export LABROOT=/ars/home/kslab
+
+mkdir -p $LABROOT/backup/full/tgt1
+mkdir -p $LABROOT/backup/full/tgt2
+mkdir -p $LABROOT/backup/inc/tgt1
+mkdir -p $LABROOT/backup/inc/tgt2
+
+mkdir -p $LABROOT/arch/$SRCDB/active
+mkdir -p $LABROOT/arch/$SRCDB/archive
+
+mkdir -p $LABROOT/data/$SRCDB/ts1
+mkdir -p $LABROOT/data/$SRCDB/ts2
+mkdir -p $LABROOT/data/$SRCDB/ts3
+
+mkdir -p $LABROOT/data/$STGDB/ts1
+mkdir -p $LABROOT/data/$STGDB/ts2
+mkdir -p $LABROOT/data/$STGDB/ts3
+
+ls -ld $LABROOT $LABROOT/backup $LABROOT/arch $LABROOT/data
