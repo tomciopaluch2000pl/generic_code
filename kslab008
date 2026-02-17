@@ -10,6 +10,32 @@ db2 create db KSLAB1_STG using codeset UTF-8 territory us
 
 8.2 Put STAGING into archive logging too (recommended for clean rollforward behavior)
 
+8.2a – create required directories (as odadm)
+
+mkdir -p /ars/home/kslab/arch/KSL1STG/active
+mkdir -p /ars/home/kslab/arch/KSL1STG/archive
+ls -ld /ars/home/kslab/arch/KSL1STG /ars/home/kslab/arch/KSL1STG/active /ars/home/kslab/arch/KSL1STG/archive
+
+8.2b – update DB cfg (note the DISK: prefix is mandatory)
+
+db2 connect to KSL1STG
+db2 "UPDATE DB CFG FOR KSL1STG USING LOGARCHMETH1 DISK:/ars/home/kslab/arch/KSL1STG/archive"
+db2 "UPDATE DB CFG FOR KSL1STG USING NEWLOGPATH /ars/home/kslab/arch/KSL1STG/active"
+db2 "UPDATE DB CFG FOR KSL1STG USING TRACKMOD YES"
+db2 connect reset
+
+8.2c – activate test (will likely be BACKUP PENDING until first backup)
+
+db2 activate db KSL1STG
+
+If you get BACKUP PENDING, that’s normal after enabling archive logging.
+
+8.2d – clear BACKUP PENDING with a tiny backup (fast)
+
+db2 "BACKUP DATABASE KSL1STG TO '/ars/home/kslab/backup/full/tgt1' COMPRESS"
+
+After this, db2 activate db KSL1STG should work cleanly.
+
 db2 connect to KSLAB1_STG
 db2 "UPDATE DB CFG FOR KSLAB1_STG USING LOGARCHMETH1 DISK:/ars/home/kslab/arch/KSLAB1_STG/archive"
 db2 "UPDATE DB CFG FOR KSLAB1_STG USING NEWLOGPATH /ars/home/kslab/arch/KSLAB1_STG/active"
