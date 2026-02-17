@@ -19,8 +19,7 @@ Step 4.2 — ONLINE FULL Backup (performance tuned)
 
 Single line:
 
-db2 "BACKUP DATABASE KSLAB1 ONLINE TO '/ars/home/kslab/backup/full/tgt1','/ars/home/kslab/backup/full/tgt2' INCLUDE LOGS COMPRESS PARALLELISM 2 BUFFER 1024"
-
+db2 "BACKUP DATABASE KSLAB1 ONLINE TO '/ars/home/kslab/backup/full/tgt1','/ars/home/kslab/backup/full/tgt2' WITH 2 BUFFER 1024 INCLUDE LOGS COMPRESS"
 Explanation:
 	•	ONLINE → database stays available
 	•	INCLUDE LOGS → required for PIT rollforward without hunting archive logs
