@@ -1,0 +1,69 @@
+Test case – short step-by-step (points)
+	1.	Prepare environment / paths (backup dirs, archive log dirs, data dirs for TS containers).
+	2.	Create SOURCE DB (PROD-like) and enable ARCHIVE LOG + TRACKMOD (for online + incremental).
+	3.	Create 2–3 tablespaces (TS1/TS2/TS3) and one table per tablespace.
+	4.	Insert baseline rows into each table (including the row that will be “lost” later).
+	5.	Take ONLINE FULL backup with COMPRESS + INCLUDE LOGS (performance knobs).
+	6.	Insert additional rows into each tablespace.
+	7.	Take ONLINE INCREMENTAL backup with COMPRESS + INCLUDE LOGS.
+	8.	Capture PIT timestamp (just before the incident).
+	9.	After incremental: insert more rows into 2 tablespaces, and in the “problem” tablespace DELETE one row.
+	10.	Create/restore into STAGING DB: redirected restore from FULL, apply INCREMENTAL, then rollforward STAGING to PIT (before delete).
+	11.	Export recovered row(s) from STAGING.
+	12.	Import/insert recovered row(s) back into SOURCE DB.
+	13.	Verify in SOURCE DB that the deleted row is back; keep logs/history for evidence.
+
+⸻
+
+Step 1 – Create the new DBs (SOURCE + STAGING) and enable online/incremental capability
+
+Below are the commands for only this step. Copy/paste as-is (adjust paths if needed).
+Assumptions: you are logged in as the DB2 instance owner and db2 works.
+
+Variables (set once in your shell)
+
+export SRCDB=LABSRC
+export STGDB=LABSTG
+export ARCHROOT=/db2arch
+
+1.1 (Optional) Clean old lab DBs
+
+db2 deactivate db $SRCDB >/dev/null 2>&1 || true
+db2 deactivate db $STGDB >/dev/null 2>&1 || true
+db2 drop db $SRCDB >/dev/null 2>&1 || true
+db2 drop db $STGDB >/dev/null 2>&1 || true
+
+1.2 Create SOURCE DB
+
+db2 create db $SRCDB using codeset UTF-8 territory US
+
+1.3 Enable ARCHIVE logging + TRACKMOD (required for online + incremental)
+
+mkdir -p $ARCHROOT/$SRCDB/active
+mkdir -p $ARCHROOT/$SRCDB/archive
+
+db2 connect to $SRCDB
+
+db2 update db cfg for $SRCDB using LOGARCHMETH1 DISK:$ARCHROOT/$SRCDB/archive
+db2 update db cfg for $SRCDB using NEWLOGPATH $ARCHROOT/$SRCDB/active
+db2 update db cfg for $SRCDB using TRACKMOD YES
+
+# (lab defaults; ok to keep for now)
+db2 update db cfg for $SRCDB using LOGFILSIZ 8192
+db2 update db cfg for $SRCDB using LOGPRIMARY 20
+db2 update db cfg for $SRCDB using LOGSECOND 40
+
+db2 connect reset
+db2stop
+db2start
+
+1.4 Verify the “online backup capability” is enabled
+
+db2 get db cfg for $SRCDB | egrep -i "LOGARCHMETH1|NEWLOGPATH|TRACKMOD"
+
+Expected:
+	•	LOGARCHMETH1 not OFF (should show DISK:/db2arch/.../archive)
+	•	NEWLOGPATH set
+	•	TRACKMOD YES
+
+
