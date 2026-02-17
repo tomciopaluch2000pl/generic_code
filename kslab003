@@ -1,0 +1,33 @@
+Step 3 — Insert baseline rows into each tablespace
+
+3.1 Connect
+
+db2 connect to KSLAB1
+
+3.2 Insert rows (one line each)
+
+db2 "INSERT INTO T_TS1 (ID,VAL,TS) VALUES (1,'ts1_row1_base',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS1 (ID,VAL,TS) VALUES (2,'ts1_row2_base',CURRENT TIMESTAMP)"
+
+db2 "INSERT INTO T_TS2 (ID,VAL,TS) VALUES (10,'ts2_row10_base',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS2 (ID,VAL,TS) VALUES (11,'ts2_row11_base',CURRENT TIMESTAMP)"
+
+db2 "INSERT INTO T_TS3 (ID,VAL,TS) VALUES (20,'ts3_row20_base',CURRENT TIMESTAMP)"
+db2 "INSERT INTO T_TS3 (ID,VAL,TS) VALUES (21,'ts3_row21_base',CURRENT TIMESTAMP)"
+
+db2 "COMMIT"
+
+3.3 Verify counts + show rows (quick evidence)
+
+db2 "SELECT 'TS1' AS TS, COUNT(*) AS CNT FROM T_TS1"
+db2 "SELECT 'TS2' AS TS, COUNT(*) AS CNT FROM T_TS2"
+db2 "SELECT 'TS3' AS TS, COUNT(*) AS CNT FROM T_TS3"
+
+db2 "SELECT * FROM T_TS2 ORDER BY ID"
+
+3.4 Disconnect
+
+db2 connect reset
+
+screenshot of the 3 count queries + the SELECT * FROM T_TS2 output.
+Then we go straight to Step 4: ONLINE FULL backup (performance + INCLUDE LOGS) using your /ars/home/kslab/backup/full/tgt1,tgt2 targets.
