@@ -1,0 +1,42 @@
+Step 4 — ONLINE FULL Backup (Production-Style)
+
+Now we simulate how you would do this in a serious environment.
+
+We will:
+	•	Use multiple targets (parallelism)
+	•	Use BUFFER
+	•	Use PARALLELISM
+	•	Use INCLUDE LOGS
+	•	Use COMPRESS
+
+⸻
+
+Step 4.1 — Connect
+
+db2 connect to KSLAB1
+
+Step 4.2 — ONLINE FULL Backup (performance tuned)
+
+Single line:
+
+db2 "BACKUP DATABASE KSLAB1 ONLINE TO '/ars/home/kslab/backup/full/tgt1','/ars/home/kslab/backup/full/tgt2' INCLUDE LOGS COMPRESS PARALLELISM 2 BUFFER 1024"
+
+Explanation:
+	•	ONLINE → database stays available
+	•	INCLUDE LOGS → required for PIT rollforward without hunting archive logs
+	•	PARALLELISM 2 → two data streams (lab small, prod much higher)
+	•	BUFFER 1024 → better throughput
+	•	COMPRESS → realistic production setting
+
+⸻
+
+Step 4.3 — Verify backup image
+
+After success, run:
+
+db2 list history backup all for KSLAB1
+
+We need:
+	•	Backup timestamp
+	•	Type = F
+	•	Online = Y
