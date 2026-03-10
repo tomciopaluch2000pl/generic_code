@@ -1,0 +1,391 @@
+DB2 11.5 / AIX 7.2 – LIVE DEMO RUNBOOK
+Scenario: Recover one deleted row from TS2 using tablespace restore into STAGING DB
+Environment based on lab: KSLAB1 -> KSL1STG
+
+Author: ChatGPT for Krzysztof Stefaniak
+Purpose: exact command flow for live presentation, with minimal narration and low risk of mistakes.
+
+=====================================================================
+0. WHAT THIS DEMO SHOWS
+=====================================================================
+1) Source DB KSLAB1 contains tablespaces TS1, TS2, TS3.
+2) Row ID=12 was deleted from table T_TS2 and COMMIT was done.
+3) We cannot simply "undo" a committed DELETE.
+4) We recover TS2 into a separate staging DB KSL1STG.
+5) We roll forward KSL1STG only up to the point-in-time before the DELETE.
+6) We export the recovered row from KSL1STG.
+7) We import the row back into KSLAB1.
+
+Known timestamps from the lab:
+- ONLINE FULL backup of KSLAB1:        20260217102911
+- ONLINE INCREMENTAL backup of KSLAB1: 20260217103901
+- PIT before DELETE:                   2026-02-17-10.47.03
+
+Deleted row:
+- Table: T_TS2
+- Row:   ID=12
+
+=====================================================================
+1. SESSION PREP
+=====================================================================
+Log in as the DB2 instance owner used for this lab.
+Example:
+
+  su - kslab
+
+Then initialize DB2 profile:
+
+  . ~/sqllib/db2profile
+
+Optional but recommended:
+
+  db2set -all
+  db2level
+  db2 get dbm cfg | grep -i DFTDBPATH
+
+=====================================================================
+2. QUICK HEALTH CHECK – SOURCE DB KSLAB1
+=====================================================================
+Check DB directory:
+
+  db2 list db directory
+
+Connect to source DB:
+
+  db2 connect to KSLAB1
+
+Show current rows in all demo tables:
+
+  db2 "select * from T_TS1 order by ID"
+  db2 "select * from T_TS2 order by ID"
+  db2 "select * from T_TS3 order by ID"
+
+Expected for T_TS2 before recovery:
+- IDs 10, 11, 13 are present
+- ID 12 is missing
+
+Check tablespace IDs (optional but good for narration):
+
+  db2 "select TBSPACEID, TBSPACE from SYSCAT.TABLESPACES order by TBSPACEID"
+
+Disconnect:
+
+  db2 connect reset
+
+=====================================================================
+3. VERIFY BACKUP HISTORY – SOURCE DB KSLAB1
+=====================================================================
+This is useful during presentation to prove which images will be used.
+
+  db2 list history backup all for KSLAB1
+
+You should be able to identify at least:
+- ONLINE FULL backup timestamp 20260217102911
+- ONLINE INCREMENTAL backup timestamp 20260217103901
+
+=====================================================================
+4. VERIFY / PREPARE STAGING DB KSL1STG
+=====================================================================
+Important: this lab uses a separate staging DB because row-level recovery is done by
+recovering the tablespace elsewhere, not directly over the source DB.
+
+Check DB directory for KSL1STG:
+
+  db2 list db directory | grep -i KSL1STG
+
+If KSL1STG already exists, connect and check logging config:
+
+  db2 connect to KSL1STG
+  db2 get db cfg for KSL1STG | egrep -i "LOGARCHMETH1|NEWLOGPATH|TRACKMOD"
+  db2 connect reset
+
+Expected from lab:
+- LOGARCHMETH1 = DISK:/ars/home/kslab/arch/KSL1STG/archive
+- NEWLOGPATH   = /ars/home/kslab/arch/KSL1STG/active
+- TRACKMOD     = YES
+
+If KSL1STG does NOT exist, create it exactly like below.
+
+Create required directories first:
+
+  mkdir -p /ars/home/kslab/arch/KSL1STG/active
+  mkdir -p /ars/home/kslab/arch/KSL1STG/archive
+  mkdir -p /ars/home/kslab/data/KSL1STG/TS2
+  mkdir -p /ars/home/kslab/export
+
+Create DB:
+
+  db2 "create db KSL1STG on /ars/home/kslab"
+
+Configure archive logging:
+
+  db2 update db cfg for KSL1STG using LOGARCHMETH1 DISK:/ars/home/kslab/arch/KSL1STG/archive
+  db2 update db cfg for KSL1STG using NEWLOGPATH /ars/home/kslab/arch/KSL1STG/active
+  db2 update db cfg for KSL1STG using TRACKMOD YES
+
+Deactivate / activate to ensure cfg is applied cleanly:
+
+  db2 deactivate db KSL1STG
+  db2 activate db KSL1STG
+
+Take one backup to clear BACKUP PENDING:
+
+  db2 "backup database KSL1STG to /ars/home/kslab/backup/full/tgt1 compress"
+
+Known lab timestamp for this backup:
+- 20260217122605
+
+Disconnect if connected:
+
+  db2 connect reset
+
+=====================================================================
+5. CLEAN TARGET TS2 CONTAINER PATH IN STAGING
+=====================================================================
+Before redirected restore, ensure target path exists and is empty.
+
+  mkdir -p /ars/home/kslab/data/KSL1STG/TS2
+  rm -f /ars/home/kslab/data/KSL1STG/TS2/*
+
+Optional check:
+
+  ls -la /ars/home/kslab/data/KSL1STG/TS2
+
+=====================================================================
+6. START TABLESPACE RESTORE INTO STAGING DB (REDIRECT)
+=====================================================================
+CRITICAL SYNTAX NOTE:
+In DB2, FROM / TAKEN AT must come BEFORE INTO.
+This clause order matters.
+
+Start redirected restore of TS2 from ONLINE FULL backup image:
+
+  db2 "restore db KSLAB1 tablespace (TS2) from /ars/home/kslab/backup/full/tgt1,/ars/home/kslab/backup/full/tgt2 taken at 20260217102911 into KSL1STG redirect"
+
+If command is accepted, DB2 will wait for container definitions.
+
+=====================================================================
+7. DEFINE TABLESPACE CONTAINER FOR TS2 IN KSL1STG
+=====================================================================
+Now connect to KSL1STG and map the restored tablespace to the new path.
+
+  db2 connect to KSL1STG
+
+Optional verification of existing tablespaces in staging before continue:
+
+  db2 list tablespaces show detail
+
+Now define container(s) for restored TS2.
+For this lab, use one FILE container path below.
+
+  db2 "set tablespace containers for 5 using (file '/ars/home/kslab/data/KSL1STG/TS2/ts2_cont1' 200000)"
+
+Notes:
+- 5 is the known TBSPACEID of TS2 in the source lab.
+- Size 200000 pages is an example for the lab. If DB2 rejects it because of size mismatch,
+  increase it generously, for example 500000 or 1000000 pages.
+- The path file will be created by DB2.
+
+Finish restore:
+
+  db2 "restore db KSLAB1 continue"
+
+Disconnect:
+
+  db2 connect reset
+
+=====================================================================
+8. APPLY INCREMENTAL BACKUP TO STAGING
+=====================================================================
+Because the source recovery chain includes an ONLINE INCREMENTAL backup,
+apply it as well before rollforward completes.
+
+  db2 "restore db KSLAB1 tablespace (TS2) from /ars/home/kslab/backup/inc/tgt1,/ars/home/kslab/backup/inc/tgt2 taken at 20260217103901 into KSL1STG"
+
+If DB2 states that rollforward is required, that is expected.
+
+=====================================================================
+9. ROLLFORWARD STAGING DB TO POINT-IN-TIME BEFORE DELETE
+=====================================================================
+This is the key recovery step.
+We stop just BEFORE the committed DELETE happened.
+
+Roll forward to PIT and complete:
+
+  db2 "rollforward db KSL1STG to 2026-02-17-10.47.03 using local time and complete tablespace (TS2)"
+
+If the above syntax is not accepted by your exact fix pack, use the simpler database-level command:
+
+  db2 "rollforward db KSL1STG to 2026-02-17-10.47.03 using local time and complete"
+
+Then validate state:
+
+  db2 rollforward db KSL1STG query status
+
+=====================================================================
+10. VERIFY THE RECOVERED ROW IN STAGING
+=====================================================================
+Connect to KSL1STG:
+
+  db2 connect to KSL1STG
+
+Check recovered data in TS2 table:
+
+  db2 "select * from T_TS2 order by ID"
+
+Expected now in KSL1STG:
+- IDs 10, 11, 12, 13
+
+Verify only the recovered row:
+
+  db2 "select * from T_TS2 where ID=12"
+
+Disconnect:
+
+  db2 connect reset
+
+=====================================================================
+11. EXPORT RECOVERED ROW FROM STAGING
+=====================================================================
+Create export directory if not present:
+
+  mkdir -p /ars/home/kslab/export
+
+Connect to KSL1STG and export only the missing row:
+
+  db2 connect to KSL1STG
+  db2 "export to /ars/home/kslab/export/T_TS2_ID12.ixf of ixf messages /ars/home/kslab/export/T_TS2_ID12.exp.msg select * from T_TS2 where ID=12"
+  db2 connect reset
+
+Check exported files:
+
+  ls -l /ars/home/kslab/export/T_TS2_ID12.*
+  cat /ars/home/kslab/export/T_TS2_ID12.exp.msg
+
+=====================================================================
+12. IMPORT THE RECOVERED ROW BACK INTO SOURCE DB KSLAB1
+=====================================================================
+Connect to source DB:
+
+  db2 connect to KSLAB1
+
+Before import, verify row is still missing in source:
+
+  db2 "select * from T_TS2 order by ID"
+  db2 "select * from T_TS2 where ID=12"
+
+Import the recovered row:
+
+  db2 "import from /ars/home/kslab/export/T_TS2_ID12.ixf of ixf messages /ars/home/kslab/export/T_TS2_ID12.imp.msg insert into T_TS2"
+
+Verify after import:
+
+  db2 "select * from T_TS2 order by ID"
+  db2 "select * from T_TS2 where ID=12"
+
+Disconnect:
+
+  db2 connect reset
+
+=====================================================================
+13. OPTIONAL CLEANUP
+=====================================================================
+If you want to reuse staging for another live demo, keep it as is.
+If you want to reset only exported artifacts:
+
+  rm -f /ars/home/kslab/export/T_TS2_ID12.ixf
+  rm -f /ars/home/kslab/export/T_TS2_ID12.exp.msg
+  rm -f /ars/home/kslab/export/T_TS2_ID12.imp.msg
+
+If you want to rebuild KSL1STG from scratch later, do it only outside the live demo window.
+
+=====================================================================
+14. LIVE DEMO NARRATION – VERY SHORT VERSION
+=====================================================================
+Use these sentences during the presentation:
+
+1) "In KSLAB1 the row ID=12 was deleted from T_TS2 and committed, so rollback is no longer possible."
+2) "Instead of restoring the full database, I restore only tablespace TS2 into a separate staging database KSL1STG."
+3) "Then I roll forward only to the point in time before the delete: 2026-02-17-10.47.03."
+4) "The row reappears in staging, I export it, and I import it back into the source database."
+5) "This is the pattern we use to discuss row recovery without impacting the production source database."
+
+=====================================================================
+15. TROUBLESHOOTING – FAST RECOVERY FROM COMMON ERRORS
+=====================================================================
+A. Error: wrong RESTORE syntax / SQL error near INTO
+Cause:
+- Clause order wrong.
+Fix:
+- Use: FROM ... TAKEN AT ... INTO ... REDIRECT
+
+Correct pattern:
+  db2 "restore db KSLAB1 tablespace (TS2) from <paths> taken at <timestamp> into KSL1STG redirect"
+
+B. Error: SQL1008C on SET TABLESPACE CONTAINERS
+Cause:
+- TS2 object does not yet exist in staging restore context.
+Fix:
+- Ensure redirected RESTORE was started successfully first.
+
+C. Error: container size too small
+Fix:
+- Increase page count in SET TABLESPACE CONTAINERS.
+Example:
+  db2 "set tablespace containers for 5 using (file '/ars/home/kslab/data/KSL1STG/TS2/ts2_cont1' 1000000)"
+
+D. Error: rollforward pending / restore pending
+Fix:
+- Query status:
+    db2 rollforward db KSL1STG query status
+- Then continue with correct ROLLFORWARD COMPLETE command.
+
+E. Error: object T_TS2 not found in staging after restore
+Cause:
+- Restore / rollforward not fully completed.
+Fix:
+- Check restore and rollforward status again.
+- Confirm TS2 was the correct tablespace containing T_TS2.
+
+=====================================================================
+16. ULTRA-SHORT COMMAND BLOCK FOR LIVE COPY/PASTE
+=====================================================================
+. ~/sqllib/db2profile
+
+db2 connect to KSLAB1
+db2 "select * from T_TS2 order by ID"
+db2 connect reset
+
+db2 list history backup all for KSLAB1
+
+mkdir -p /ars/home/kslab/data/KSL1STG/TS2
+rm -f /ars/home/kslab/data/KSL1STG/TS2/*
+
+db2 "restore db KSLAB1 tablespace (TS2) from /ars/home/kslab/backup/full/tgt1,/ars/home/kslab/backup/full/tgt2 taken at 20260217102911 into KSL1STG redirect"
+
+db2 connect to KSL1STG
+db2 "set tablespace containers for 5 using (file '/ars/home/kslab/data/KSL1STG/TS2/ts2_cont1' 200000)"
+db2 connect reset
+
+db2 "restore db KSLAB1 continue"
+db2 "restore db KSLAB1 tablespace (TS2) from /ars/home/kslab/backup/inc/tgt1,/ars/home/kslab/backup/inc/tgt2 taken at 20260217103901 into KSL1STG"
+db2 "rollforward db KSL1STG to 2026-02-17-10.47.03 using local time and complete"
+
+db2 connect to KSL1STG
+db2 "select * from T_TS2 where ID=12"
+db2 "export to /ars/home/kslab/export/T_TS2_ID12.ixf of ixf messages /ars/home/kslab/export/T_TS2_ID12.exp.msg select * from T_TS2 where ID=12"
+db2 connect reset
+
+db2 connect to KSLAB1
+db2 "import from /ars/home/kslab/export/T_TS2_ID12.ixf of ixf messages /ars/home/kslab/export/T_TS2_ID12.imp.msg insert into T_TS2"
+db2 "select * from T_TS2 order by ID"
+db2 connect reset
+
+=====================================================================
+17. IMPORTANT HONEST NOTE
+=====================================================================
+The runbook above is aligned to the lab information already captured.
+The one place that may need environment-specific adjustment during the live demo is the
+container page count in SET TABLESPACE CONTAINERS. If 200000 pages is rejected, simply
+increase it and rerun that single command before RESTORE CONTINUE.
+
