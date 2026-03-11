@@ -1,0 +1,264 @@
+
+DB2 11.5 AIX – FULL TABLESPACE RESTORE RUNBOOK
+Scenario: Restore one complete tablespace (TS2), not a single row
+Environment: KSLAB1
+Tablespace: TS2
+TBSPACEID: 5
+
+================================================================================
+1. PURPOSE
+================================================================================
+
+This runbook demonstrates how to restore one full tablespace in DB2 11.5
+without restoring the entire database.
+
+Typical use case:
+- one tablespace becomes unavailable, corrupted, or lost
+- the rest of the database remains intact
+- we restore only the affected tablespace and roll it forward to the end of logs
+
+This is different from row recovery:
+- here we recover the whole TS2 tablespace
+- we do not export/import an individual row
+- we do not use a separate staging database
+
+================================================================================
+2. LAB VALUES USED IN THIS DEMO
+================================================================================
+
+Source database:                KSLAB1
+Tablespace to recover:          TS2
+Tablespace ID:                  5
+Online FULL backup timestamp:   20260217102911
+FULL backup paths:              /ars/home/kslab/backup/full/tgt1
+                                /ars/home/kslab/backup/full/tgt2
+Archive logs path:              /ars/home/kslab/arch/KSLAB1/archive
+
+Important:
+If your environment has different paths or a different backup timestamp,
+replace them before the demo.
+
+================================================================================
+3. PRE-CHECKS
+================================================================================
+
+3.1 Connect to the database
+
+db2 connect to KSLAB1
+
+3.2 Confirm that TS2 exists
+
+db2 "select TBSPACEID, TBSPACE, DATATYPE from SYSCAT.TABLESPACES order by TBSPACEID"
+
+Expected:
+- TS2 should be listed with TBSPACEID=5
+
+3.3 Show data currently stored in the table placed in TS2
+
+db2 "select * from T_TS2 order by ID"
+
+3.4 Check backup history
+
+db2 list history backup all for KSLAB1
+
+Look for:
+- ONLINE backup
+- timestamp 20260217102911
+
+================================================================================
+4. OPTIONAL FAILURE SIMULATION
+================================================================================
+
+For a live demo, you can simulate a problem by making TS2 unavailable.
+Use only if this is a dedicated lab.
+
+Example explanation to audience:
+"We assume that tablespace TS2 is damaged or unavailable. The recovery target
+is the entire tablespace, not a single row."
+
+You do not need to physically destroy the container for a presentation if you
+prefer a clean demo narrative.
+
+================================================================================
+5. TAKE TS2 OFFLINE
+================================================================================
+
+db2 connect to KSLAB1
+
+db2 "set tablespace TS2 offline"
+
+Verify status:
+
+db2 list tablespaces show detail
+
+Look for TS2 state and confirm it is offline / unavailable for use.
+
+================================================================================
+6. RESTORE THE WHOLE TABLESPACE
+================================================================================
+
+Run the tablespace restore from the online FULL backup:
+
+db2 restore db KSLAB1 \
+tablespace (TS2) \
+online \
+from /ars/home/kslab/backup/full/tgt1,/ars/home/kslab/backup/full/tgt2 \
+taken at 20260217102911
+
+What this does:
+- restores only TS2
+- does not restore the whole database
+- prepares the tablespace for rollforward recovery
+
+Expected result:
+DB20000I  The RESTORE DATABASE command completed successfully.
+
+================================================================================
+7. ROLLFORWARD THE TABLESPACE TO END OF LOGS
+================================================================================
+
+db2 rollforward db KSLAB1 \
+to end of logs \
+and complete \
+tablespace (TS2) \
+online
+
+What this does:
+- replays logs for TS2
+- brings the tablespace to the latest consistent point
+- makes TS2 available again
+
+Expected result:
+DB20000I  The ROLLFORWARD command completed successfully.
+
+================================================================================
+8. BRING TS2 ONLINE (IF NEEDED)
+================================================================================
+
+In many cases, after successful rollforward completion, the tablespace becomes
+usable automatically. If needed, verify status first:
+
+db2 list tablespaces show detail
+
+If the tablespace still needs to be brought online explicitly:
+
+db2 "set tablespace TS2 online"
+
+================================================================================
+9. VALIDATE THE RESULT
+================================================================================
+
+9.1 Reconnect if needed
+
+db2 connect to KSLAB1
+
+9.2 Confirm tablespace state
+
+db2 list tablespaces show detail
+
+9.3 Query the application table again
+
+db2 "select * from T_TS2 order by ID"
+
+Explain during demo:
+"The whole tablespace has been restored and rolled forward to the end of logs.
+At this point, all objects stored in TS2 are available again."
+
+================================================================================
+10. OPTIONAL POST-CHECKS
+================================================================================
+
+10.1 Show history again
+
+db2 list history backup all for KSLAB1
+
+10.2 Show tablespace metadata
+
+db2 "select TBSPACEID, TBSPACE, EXTENTSIZE, PAGESIZE, DATATYPE from SYSCAT.TABLESPACES where TBSPACE='TS2'"
+
+================================================================================
+11. WHAT TO SAY DURING THE DEMO
+================================================================================
+
+Suggested narration:
+
+1. "This scenario is tablespace-level recovery, not row-level recovery."
+2. "We assume that TS2 is the affected storage unit."
+3. "Instead of restoring the entire database, we isolate recovery to one
+   tablespace only."
+4. "We restore TS2 from the online backup."
+5. "Then we roll forward to the end of logs to recover the latest changes."
+6. "This is significantly faster and safer for large environments than a full
+   database restore."
+
+================================================================================
+12. COMMON ERRORS / TROUBLESHOOTING
+================================================================================
+
+A) SQL0290N or restore/rollforward state issues
+- Check tablespace state:
+  db2 list tablespaces show detail
+- Make sure TS2 is the correct tablespace name
+- Confirm the backup timestamp exists in history
+
+B) Backup path issue
+- Verify both paths exist:
+  /ars/home/kslab/backup/full/tgt1
+  /ars/home/kslab/backup/full/tgt2
+- Confirm the backup image is accessible to the DB2 instance owner
+
+C) Missing logs during rollforward
+- Verify archive logging is enabled:
+  db2 get db cfg for KSLAB1 | grep -i -E "LOGARCHMETH1|NEWLOGPATH|TRACKMOD"
+- Confirm the required log files are present in the archive location
+
+D) Wrong expectation after restore
+- Remember:
+  restoring a whole tablespace recovers all objects inside it
+  this is not a row extraction workflow
+
+================================================================================
+13. LIVE DEMO QUICK COMMAND BLOCK
+================================================================================
+
+db2 connect to KSLAB1
+
+db2 "select * from T_TS2 order by ID"
+
+db2 list history backup all for KSLAB1
+
+db2 "set tablespace TS2 offline"
+
+db2 restore db KSLAB1 \
+tablespace (TS2) \
+online \
+from /ars/home/kslab/backup/full/tgt1,/ars/home/kslab/backup/full/tgt2 \
+taken at 20260217102911
+
+db2 rollforward db KSLAB1 \
+to end of logs \
+and complete \
+tablespace (TS2) \
+online
+
+db2 list tablespaces show detail
+
+db2 "select * from T_TS2 order by ID"
+
+================================================================================
+14. KEY DIFFERENCE VS ROW RECOVERY
+================================================================================
+
+Whole tablespace restore:
+- target = complete TS2
+- restore into source database
+- rollforward to end of logs
+- no export/import needed
+
+Row recovery:
+- target = one deleted row
+- restore TS2 into staging DB
+- rollforward to point in time before DELETE
+- export recovered row and import it back
+
+End of runbook.
