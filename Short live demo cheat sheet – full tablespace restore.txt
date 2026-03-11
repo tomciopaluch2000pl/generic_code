@@ -1,0 +1,99 @@
+DB2 11.5 – FULL TABLESPACE RESTORE LIVE DEMO
+Environment: KSLAB1
+Scenario: Restore TS2 as a whole tablespace
+
+--------------------------------------------------
+1. INTRODUCTION
+--------------------------------------------------
+
+Explain:
+"In this scenario, I am not recovering a single row.
+I am restoring the whole TS2 tablespace and bringing it
+forward to the latest consistent state."
+
+--------------------------------------------------
+2. PRE-CHECK
+--------------------------------------------------
+
+db2 connect to KSLAB1
+
+db2 "select * from T_TS2 order by ID"
+
+db2 list history backup all for KSLAB1
+
+Explain:
+"We confirm the objects in TS2 and verify the backup image
+that will be used for the restore."
+
+Important backup:
+ONLINE FULL = 20260217102911
+
+--------------------------------------------------
+3. TAKE TS2 OFFLINE
+--------------------------------------------------
+
+db2 "set tablespace TS2 offline"
+
+Explain:
+"We isolate the affected tablespace before recovery."
+
+--------------------------------------------------
+4. RESTORE THE WHOLE TABLESPACE
+--------------------------------------------------
+
+db2 restore db KSLAB1 \
+tablespace (TS2) \
+online \
+from /ars/home/kslab/backup/full/tgt1,/ars/home/kslab/backup/full/tgt2 \
+taken at 20260217102911
+
+Explain:
+"This restores only TS2, not the full database."
+
+--------------------------------------------------
+5. ROLLFORWARD TO END OF LOGS
+--------------------------------------------------
+
+db2 rollforward db KSLAB1 \
+to end of logs \
+and complete \
+tablespace (TS2) \
+online
+
+Explain:
+"This replays transaction logs and brings TS2 to the
+latest consistent point."
+
+--------------------------------------------------
+6. VERIFY THE RESULT
+--------------------------------------------------
+
+db2 list tablespaces show detail
+
+db2 "select * from T_TS2 order by ID"
+
+Explain:
+"The full tablespace is now available again, and all data
+inside TS2 has been recovered."
+
+--------------------------------------------------
+7. CLOSING MESSAGE
+--------------------------------------------------
+
+Explain:
+"This is a faster and more targeted recovery method than
+restoring the entire database, which is especially important
+for large DB2 environments."
+
+--------------------------------------------------
+8. COPY/PASTE BLOCK
+--------------------------------------------------
+
+db2 connect to KSLAB1
+db2 "select * from T_TS2 order by ID"
+db2 list history backup all for KSLAB1
+db2 "set tablespace TS2 offline"
+db2 restore db KSLAB1 tablespace (TS2) online from /ars/home/kslab/backup/full/tgt1,/ars/home/kslab/backup/full/tgt2 taken at 20260217102911
+db2 rollforward db KSLAB1 to end of logs and complete tablespace (TS2) online
+db2 list tablespaces show detail
+db2 "select * from T_TS2 order by ID"
