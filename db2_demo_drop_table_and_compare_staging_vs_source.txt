@@ -1,0 +1,278 @@
+DB2 11.5 AIX – DEMO LAB
+Scenario: create a dedicated tablespace, put two tables into it, back it up,
+drop one table, recover it both via STAGING DB and directly into SOURCE DB,
+and then explain what changes when the TABLESPACE itself is dropped.
+
+Environment assumptions
+-----------------------
+Source DB:   KSLAB1
+Staging DB:  KSL2STG
+Base path:   /ars/home/kslab
+Source data path:   /ars/home/kslab/data/KSLAB1
+Staging data path:  /ars/home/kslab/data/KSL2STG
+Backup path:        /ars/home/kslab/backup/demo
+Source logs path:   /ars/home/kslab/arch/KSLAB1/archive
+Staging logs path:  /ars/home/kslab/arch/KSL2STG/archive
+
+Objects used in this demo
+-------------------------
+Tablespace: TSDEMO
+Tables:
+  DEMO_T1
+  DEMO_T2
+
+IMPORTANT LOGIC
+---------------
+1. Use a dedicated tablespace only for the demo tables.
+2. This allows safe direct restore into SOURCE DB for the dropped-table scenario,
+   because you are rewinding only isolated demo objects.
+3. For a DROPPED TABLESPACE itself, do NOT plan the demo as direct restore to source.
+   Practical and safest approach: recover to STAGING / alternate target first.
+
+===============================================================================
+PART A – CREATE TEST OBJECTS IN A NEW DEDICATED TABLESPACE
+===============================================================================
+
+1. Create OS directories
+
+mkdir -p /ars/home/kslab/data/KSLAB1
+mkdir -p /ars/home/kslab/data/KSL2STG
+mkdir -p /ars/home/kslab/backup/demo/tgt1
+mkdir -p /ars/home/kslab/backup/demo/tgt2
+mkdir -p /ars/home/kslab/arch/KSL2STG/active
+mkdir -p /ars/home/kslab/arch/KSL2STG/archive
+
+2. Connect to source DB
+
+db2 connect to KSLAB1
+
+3. Create a new dedicated tablespace
+
+db2 "create tablespace TSDEMO managed by database using (file '/ars/home/kslab/data/KSLAB1/tsdemo_cont1' 20000) extentsize 32 prefetchsize 32 bufferpool IBMDEFAULTBP"
+
+4. Find the tablespace ID immediately and write it down
+
+db2 "select TBSPACEID, TBSPACE from SYSCAT.TABLESPACES where TBSPACE='TSDEMO'"
+
+Expected:
+one row with TSDEMO and a TBSPACEID
+Write this value down as: <TSDEMO_ID>
+
+5. Create two tables inside TSDEMO
+
+db2 "create table DEMO_T1 (ID int not null, TXT varchar(100), primary key (ID)) in TSDEMO"
+db2 "create table DEMO_T2 (ID int not null, TXT varchar(100), primary key (ID)) in TSDEMO"
+
+6. Insert two rows into each table
+
+db2 "insert into DEMO_T1 values (1,'DEMO_T1_ROW_1'), (2,'DEMO_T1_ROW_2')"
+db2 "insert into DEMO_T2 values (1,'DEMO_T2_ROW_1'), (2,'DEMO_T2_ROW_2')"
+db2 commit
+
+7. Verify the data
+
+db2 "select * from DEMO_T1 order by ID"
+db2 "select * from DEMO_T2 order by ID"
+
+===============================================================================
+PART B – TAKE AN ONLINE FULL BACKUP FOR THE DEMO
+===============================================================================
+
+8. Take an online full backup with logs included
+
+db2 "backup db KSLAB1 online to /ars/home/kslab/backup/demo/tgt1,/ars/home/kslab/backup/demo/tgt2 compress include logs"
+
+9. Find the backup timestamp
+
+db2 list history backup all for KSLAB1
+
+Write the timestamp down as:
+<DEMO_FULL_TS>
+
+10. Optional but recommended: inspect the backup header and confirm TSDEMO exists there
+
+find /ars/home/kslab/backup/demo -name "*.001"
+
+Then use the real image file returned above, for example:
+db2ckbkp -H /ars/home/kslab/backup/demo/tgt1/KSLAB1.0.kslab.NODE0000.CATN0000.<DEMO_FULL_TS>.001
+
+Look for:
+- TSDEMO
+- its TBSPACEID
+- standard system tablespaces
+
+===============================================================================
+PART C – DROP ONE TABLE AND CAPTURE A PIT FOR STAGING RECOVERY
+===============================================================================
+
+11. Capture PIT just BEFORE the drop
+
+db2 "values current timestamp"
+
+Write this down as:
+<PIT_BEFORE_DROP>
+
+12. Drop one table from the dedicated tablespace
+
+db2 "drop table DEMO_T1"
+
+13. Prove it is gone from source DB
+
+db2 "select * from DEMO_T2 order by ID"
+db2 "select * from DEMO_T1 order by ID"
+
+Expected:
+- DEMO_T2 still exists
+- DEMO_T1 fails with SQL0204N or similar undefined name
+
+===============================================================================
+PART D – RECOVER THE DROPPED TABLE VIA STAGING DB
+===============================================================================
+
+14. Create the staging DB
+
+db2 "create db KSL2STG using codeset UTF-8 territory us"
+
+15. Enable archive logging on staging DB
+
+db2 update db cfg for KSL2STG using LOGARCHMETH1 DISK:/ars/home/kslab/arch/KSL2STG/archive
+db2 update db cfg for KSL2STG using NEWLOGPATH /ars/home/kslab/arch/KSL2STG/active
+db2 update db cfg for KSL2STG using TRACKMOD YES
+
+16. Clear BACKUP PENDING on staging DB
+
+db2 "backup db KSL2STG to /ars/home/kslab/backup/demo/tgt1 compress"
+
+17. Start redirected restore of ONLY TSDEMO into staging DB
+
+db2 restore db KSLAB1 tablespace (TSDEMO) from /ars/home/kslab/backup/demo/tgt1,/ars/home/kslab/backup/demo/tgt2 taken at <DEMO_FULL_TS> into KSL2STG redirect
+
+18. Define the container in staging DB
+    Replace <TSDEMO_ID> with the real ID captured in step 4.
+
+db2 "set tablespace containers for <TSDEMO_ID> using (file '/ars/home/kslab/data/KSL2STG/tsdemo_cont1' 20000)"
+
+19. Continue the restore
+
+db2 restore db KSLAB1 continue
+
+20. Roll forward STAGING DB to PIT just before the DROP
+
+db2 rollforward db KSL2STG to <PIT_BEFORE_DROP> using local time and complete
+
+21. Verify that both tables exist in staging DB again
+
+db2 connect to KSL2STG
+db2 "select * from DEMO_T1 order by ID"
+db2 "select * from DEMO_T2 order by ID"
+
+22. Export the recovered table from staging DB
+
+db2 "export to /ars/home/kslab/backup/demo/DEMO_T1_recovered.del of del select * from DEMO_T1 order by ID"
+
+23. Recreate the dropped table in source DB
+
+db2 connect to KSLAB1
+db2 "create table DEMO_T1 (ID int not null, TXT varchar(100), primary key (ID)) in TSDEMO"
+
+24. Import the recovered data back into source DB
+
+db2 "import from /ars/home/kslab/backup/demo/DEMO_T1_recovered.del of del insert into DEMO_T1"
+
+25. Final check in source DB
+
+db2 "select * from DEMO_T1 order by ID"
+db2 "select * from DEMO_T2 order by ID"
+
+===============================================================================
+PART E – RECOVER THE SAME DROPPED-TABLE SCENARIO DIRECTLY INTO SOURCE DB
+===============================================================================
+
+This works only because:
+- TSDEMO is dedicated to demo objects
+- you accept rewinding the entire TSDEMO to a PIT before the DROP
+
+IMPORTANT:
+If there were additional wanted changes in TSDEMO after <PIT_BEFORE_DROP>,
+they would be lost by this direct-source method.
+
+26. First drop DEMO_T1 again so you can test direct-source recovery
+
+db2 connect to KSLAB1
+db2 "drop table DEMO_T1"
+
+27. Confirm it is gone
+
+db2 "select * from DEMO_T1 order by ID"
+
+28. Restore the whole TSDEMO directly into SOURCE DB
+
+db2 restore db KSLAB1 tablespace (TSDEMO) online from /ars/home/kslab/backup/demo/tgt1,/ars/home/kslab/backup/demo/tgt2 taken at <DEMO_FULL_TS>
+
+29. Roll forward TSDEMO in source DB to PIT before the DROP
+
+db2 rollforward db KSLAB1 to <PIT_BEFORE_DROP> using local time and complete tablespace (TSDEMO) online
+
+30. Verify the result in source DB
+
+db2 "select * from DEMO_T1 order by ID"
+db2 "select * from DEMO_T2 order by ID"
+
+===============================================================================
+PART F – WHAT CHANGES IF THE TABLESPACE ITSELF IS DROPPED?
+===============================================================================
+
+Short answer:
+For your presentation, use this rule:
+- DROPPED TABLE in an existing tablespace:
+  yes, you can demonstrate both STAGING recovery and direct SOURCE recovery
+- DROPPED TABLESPACE itself:
+  do NOT rely on direct restore into source DB as the demo path
+  use STAGING / alternate restore target
+
+Why?
+- once the tablespace itself is dropped, you lose the object from the source catalog
+- direct restore into the same source DB becomes a metadata-sensitive operation
+- in practice, for a safe and repeatable lab, staging is the correct path
+
+===============================================================================
+PART G – OPTIONAL TEST FOR A DROPPED TABLESPACE
+===============================================================================
+
+31. Show TSDEMO exists in source DB and in the backup
+
+db2 connect to KSLAB1
+db2 "select TBSPACEID, TBSPACE from SYSCAT.TABLESPACES where TBSPACE='TSDEMO'"
+
+32. Drop both tables first to avoid dependency errors if needed
+
+db2 "drop table DEMO_T1"
+db2 "drop table DEMO_T2"
+
+33. Drop the tablespace
+
+db2 "drop tablespace TSDEMO"
+
+34. Confirm TSDEMO no longer exists in the source DB catalog
+
+db2 "select TBSPACEID, TBSPACE from SYSCAT.TABLESPACES where TBSPACE='TSDEMO'"
+
+35. But confirm TSDEMO still exists in the backup image
+
+find /ars/home/kslab/backup/demo -name "*.001"
+db2ckbkp -H /path/to/the/real/backup/image.001
+
+36. Recommended recovery path after DROP TABLESPACE:
+    restore into STAGING or alternate DB, not directly into source DB.
+
+===============================================================================
+PART H – SUMMARY YOU CAN SAY DURING THE DEMO
+===============================================================================
+
+1. I created a dedicated tablespace so the recovery scope is isolated.
+2. I placed two demo tables inside it and backed them up online with logs.
+3. Then I dropped one table and recovered it in two ways.
+4. First, by restoring the tablespace into a staging database and exporting only the required table.
+5. Second, by restoring the entire isolated tablespace directly into the source database to a point in time before the drop.
+6. The key difference is that staging is selective and safer, while direct source restore rewinds the entire tablespace.
+7. If the tablespace itself is dropped, I do not rely on direct source restore. I recover through staging.
