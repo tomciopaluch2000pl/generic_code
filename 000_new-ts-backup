@@ -1,0 +1,712 @@
+# DB2 11.5 AIX – UAT Single Tablespace Restore Test
+
+**Author:** Krzysztof Stefaniak  
+**Team:** TahD  
+**Environment:** UAT  
+**Platform:** AIX 7.2  
+**Scope:** Inventory evidence, backup, recreate DEV-like test objects on UAT, execute restore of a single tablespace, and document the full procedure in one file.
+
+---
+
+## 1. Objective
+
+The purpose of this test is to validate, on a **different UAT database**, that we can:
+
+1. capture the current database state with screenshots and command outputs,
+2. perform a consistent backup,
+3. create the same recovery test objects as in DEV,
+4. simulate a loss scenario,
+5. restore **one selected tablespace only**,
+6. verify recovered data,
+7. keep the full execution evidence in one consolidated document.
+
+This document is written as a **single execution runbook + evidence file**.
+
+---
+
+## 2. Assumptions
+
+- DB2 level: **11.5**
+- OS: **AIX 7.2**
+- Test is executed on **UAT**
+- Archive logging must be enabled for point-in-time / tablespace recovery scenarios
+- Commands below are prepared in DB2 CLP style
+- Replace placeholder values before execution:
+  - `<DB_NAME>`
+  - `<STAGING_DB>`
+  - `<TS_NAME>`
+  - `<TS_ID>`
+  - `<DB2INSTANCE>`
+  - `<BACKUP_BASE>`
+  - `<ARCHIVE_BASE>`
+  - `<DATA_BASE>`
+  - `<PIT_TIMESTAMP>`
+  - `<BACKUP_TIMESTAMP>`
+
+---
+
+## 3. High-Level Test Flow
+
+### Phase A – Evidence and inventory
+- Identify current database layout
+- Capture tablespaces, containers, tables, logging config, backup history
+- Save screenshots / terminal captures
+
+### Phase B – UAT backup baseline
+- Take backup before any changes
+
+### Phase C – Recreate DEV-like test setup on UAT
+- Create dedicated test tablespace
+- Create test tables
+- Insert sample rows
+- Take recovery backup
+
+### Phase D – Simulate issue
+- Delete table data or drop table(s)
+- Capture evidence of the issue
+
+### Phase E – Restore a single tablespace
+- Preferred: restore into **staging database** and extract data
+- Optional: compare with direct restore into source DB if business allows outage / recovery operation
+
+### Phase F – Validation
+- Confirm recovered rows / objects
+- Record conclusions and limitations
+
+---
+
+## 4. Variables to Fill In Before Execution
+
+```sh
+export DB_NAME=<DB_NAME>
+export STAGING_DB=<STAGING_DB>
+export DB2INSTANCE=<DB2INSTANCE>
+export BACKUP_BASE=<BACKUP_BASE>
+export ARCHIVE_BASE=<ARCHIVE_BASE>
+export DATA_BASE=<DATA_BASE>
+export TS_NAME=<TS_NAME>
+```
+
+### Example structure
+
+```sh
+export BACKUP_BASE=/ars/home/kslab/backup
+export ARCHIVE_BASE=/ars/home/kslab/arch
+export DATA_BASE=/ars/home/kslab/data
+```
+
+---
+
+## 5. Phase A – Current State Inventory and Screenshots
+
+### 5.1 Connect to the database
+
+```sh
+su - $DB2INSTANCE
+. ~${DB2INSTANCE}/sqllib/db2profile
+
+db2 list db directory
+db2 connect to $DB_NAME
+```
+
+**Screenshot evidence to capture:**
+- database directory entry,
+- successful connection to the target UAT database.
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-01: DB directory and connection]`
+
+---
+
+### 5.2 Database configuration
+
+```sh
+db2 get db cfg for $DB_NAME | egrep -i "LOGARCHMETH1|LOGARCHMETH2|NEWLOGPATH|TRACKMOD|AUTO_DEL_REC_OBJ|REC_HIS_RETENTN|USEREXIT|MIRRORLOGPATH"
+```
+
+**Expected focus:**
+- archive logging method,
+- active log path,
+- TRACKMOD setting.
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-02: Logging and recovery configuration]`
+
+---
+
+### 5.3 Tablespace inventory
+
+```sh
+db2 "select tbsp_id, tbsp_name, tbsp_type, tbsp_content_type, state from sysibmadm.tbsp_utilization order by tbsp_id"
+```
+
+If the above view is not available in the desired format, use:
+
+```sh
+db2 "select TBSPACEID, TBSPACE, PAGESIZE, DATATYPE from SYSCAT.TABLESPACES order by TBSPACEID"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-03: Tablespace inventory before test]`
+
+---
+
+### 5.4 Tablespace containers
+
+```sh
+db2 list tablespace containers for 0 show detail
+db2 list tablespace containers for 1 show detail
+db2 list tablespace containers for 2 show detail
+```
+
+For the future target tablespace, also capture the container output after it is created.
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-04: Existing tablespace containers]`
+
+---
+
+### 5.5 Existing tables
+
+```sh
+db2 "select tabschema, tabname, tbspace from syscat.tables where type='T' order by tabschema, tabname"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-05: Existing user tables]`
+
+---
+
+### 5.6 Backup history
+
+```sh
+db2 list history backup all for $DB_NAME
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-06: Backup history before test]`
+
+---
+
+### 5.7 Recommended extra evidence
+
+```sh
+db2pd -db $DB_NAME -tablespaces
+df -g
+ls -R $BACKUP_BASE
+ls -R $ARCHIVE_BASE
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-07: db2pd/filesystem/backup locations]`
+
+---
+
+## 6. Phase B – Baseline Backup Before Changes
+
+Create target folders if needed:
+
+```sh
+mkdir -p $BACKUP_BASE/full/tgt1
+mkdir -p $BACKUP_BASE/full/tgt2
+mkdir -p $BACKUP_BASE/inc/tgt1
+mkdir -p $BACKUP_BASE/inc/tgt2
+```
+
+Run baseline backup:
+
+```sh
+db2 backup database $DB_NAME online to $BACKUP_BASE/full/tgt1,$BACKUP_BASE/full/tgt2 \
+  compress include logs with 2 buffers buffer 1024 parallelism 2
+```
+
+Capture the backup timestamp.
+
+```sh
+db2 list history backup all for $DB_NAME
+```
+
+Record here:
+
+- **Baseline backup timestamp:** `<BACKUP_TIMESTAMP_BASELINE>`
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-08: Baseline online full backup]`
+
+---
+
+## 7. Phase C – Recreate DEV-Like Test Objects on UAT
+
+The safest approach is to create a **dedicated UAT test tablespace** and dedicated test tables.
+
+### 7.1 Create a dedicated tablespace
+
+Example using automatic storage:
+
+```sh
+db2 "create regular tablespace $TS_NAME pagesize 32768 managed by automatic storage autoresize yes"
+```
+
+If DMS with explicit containers is required, adapt to your UAT layout:
+
+```sh
+mkdir -p $DATA_BASE/$DB_NAME/$TS_NAME
+
+db2 "create regular tablespace $TS_NAME pagesize 32768 managed by database using (file '$DATA_BASE/$DB_NAME/$TS_NAME/${TS_NAME}.cont' 200000) autoresize yes"
+```
+
+Verify:
+
+```sh
+db2 "select TBSPACEID, TBSPACE, PAGESIZE, DATATYPE from SYSCAT.TABLESPACES where TBSPACE='$TS_NAME'"
+```
+
+Record here:
+
+- **Created tablespace name:** `<TS_NAME>`
+- **Created tablespace ID:** `<TS_ID>`
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-09: Created UAT test tablespace]`
+
+---
+
+### 7.2 Create DEV-like test tables
+
+Use a dedicated schema to avoid conflicts.
+
+```sh
+db2 "create schema RCVLAB"
+```
+
+Create two tables in the selected test tablespace:
+
+```sh
+db2 "create table RCVLAB.T_RESTORE_A (
+  ID integer not null,
+  NAME varchar(100),
+  CREATED_TS timestamp default current timestamp,
+  primary key (ID)
+) in $TS_NAME"
+
+
+db2 "create table RCVLAB.T_RESTORE_B (
+  ID integer not null,
+  DESCRIPTION varchar(200),
+  CREATED_TS timestamp default current timestamp,
+  primary key (ID)
+) in $TS_NAME"
+```
+
+Verify placement:
+
+```sh
+db2 "select tabschema, tabname, tbspace from syscat.tables where tabschema='RCVLAB' order by tabname"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-10: Tables created in target tablespace]`
+
+---
+
+### 7.3 Insert sample rows
+
+```sh
+db2 "insert into RCVLAB.T_RESTORE_A (ID, NAME) values (1, 'ROW_A_1'), (2, 'ROW_A_2')"
+db2 "insert into RCVLAB.T_RESTORE_B (ID, DESCRIPTION) values (1, 'ROW_B_1'), (2, 'ROW_B_2')"
+db2 commit
+```
+
+Verify data:
+
+```sh
+db2 "select * from RCVLAB.T_RESTORE_A order by ID"
+db2 "select * from RCVLAB.T_RESTORE_B order by ID"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-11: Initial test data before recovery backup]`
+
+---
+
+### 7.4 Recovery backup after object creation
+
+This is the critical backup for later restore.
+
+```sh
+db2 backup database $DB_NAME online to $BACKUP_BASE/full/tgt1,$BACKUP_BASE/full/tgt2 \
+  compress include logs with 2 buffers buffer 1024 parallelism 2
+```
+
+Capture the exact timestamp from the command output or history.
+
+```sh
+db2 list history backup all for $DB_NAME
+```
+
+Record here:
+
+- **Recovery backup timestamp:** `<BACKUP_TIMESTAMP_TEST>`
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-12: Recovery backup containing the new tablespace]`
+
+---
+
+## 8. Phase D – Simulate Data Loss / Object Loss
+
+Choose one of the following scenarios.
+
+### Option 1 – Delete rows only
+
+```sh
+db2 "select current timestamp from sysibm.sysdummy1"
+```
+
+Record point-in-time before delete:
+
+- **PIT before delete:** `<PIT_TIMESTAMP>`
+
+Then delete rows:
+
+```sh
+db2 "delete from RCVLAB.T_RESTORE_B where ID=2"
+db2 commit
+```
+
+Verify:
+
+```sh
+db2 "select * from RCVLAB.T_RESTORE_B order by ID"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-13: Data loss simulated by delete]`
+
+### Option 2 – Drop one table
+
+```sh
+db2 "drop table RCVLAB.T_RESTORE_B"
+```
+
+Verify:
+
+```sh
+db2 "select tabschema, tabname, tbspace from syscat.tables where tabschema='RCVLAB' order by tabname"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-13B: Object loss simulated by drop]`
+
+> For a clean single tablespace restore demonstration, **Option 2** is visually stronger because it shows recovery of a dropped object contained in that tablespace.
+
+---
+
+## 9. Phase E – Restore a Single Tablespace
+
+## Preferred Method: Restore to Staging Database
+
+This is the safest approach because it avoids direct risk to the UAT source database.
+
+---
+
+### 9.1 Create staging database
+
+```sh
+db2 create db $STAGING_DB using codeset UTF-8 territory US
+```
+
+Prepare log/archive paths:
+
+```sh
+mkdir -p $ARCHIVE_BASE/$STAGING_DB/active
+mkdir -p $ARCHIVE_BASE/$STAGING_DB/archive
+```
+
+Configure logging:
+
+```sh
+db2 update db cfg for $STAGING_DB using LOGARCHMETH1 DISK:$ARCHIVE_BASE/$STAGING_DB/archive
+db2 update db cfg for $STAGING_DB using NEWLOGPATH $ARCHIVE_BASE/$STAGING_DB/active
+db2 update db cfg for $STAGING_DB using TRACKMOD YES
+```
+
+Clear backup pending on staging DB:
+
+```sh
+db2 backup database $STAGING_DB to $BACKUP_BASE/full/tgt1 compress
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-14: Staging DB prepared]`
+
+---
+
+### 9.2 Start redirected restore of the single tablespace
+
+> Important: clause order matters. In DB2, keep the syntax in the correct order: **FROM / TAKEN AT / INTO / REDIRECT**.
+
+Example:
+
+```sh
+db2 "restore db $DB_NAME tablespace ($TS_NAME) \
+from $BACKUP_BASE/full/tgt1,$BACKUP_BASE/full/tgt2 \
+taken at <BACKUP_TIMESTAMP_TEST> \
+into $STAGING_DB redirect"
+```
+
+If the backup image spans only one path, reduce the `from` clause accordingly.
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-15: Redirected tablespace restore started]`
+
+---
+
+### 9.3 Set containers for the restored tablespace in staging
+
+First identify the tablespace ID in the restore context if needed.
+
+Example explicit container mapping:
+
+```sh
+mkdir -p $DATA_BASE/$STAGING_DB/$TS_NAME
+
+db2 "set tablespace containers for <TS_ID> using (file '$DATA_BASE/$STAGING_DB/$TS_NAME/${TS_NAME}.cont' 200000)"
+```
+
+If automatic storage is used end-to-end, container management may differ. In that case verify whether explicit container mapping is still required for the redirected restore in your layout.
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-16: Container mapping for restored tablespace]`
+
+---
+
+### 9.4 Continue the restore
+
+```sh
+db2 "restore db $STAGING_DB continue"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-17: Restore continued successfully]`
+
+---
+
+### 9.5 Roll forward the staging DB / restored tablespace
+
+If the scenario is row recovery after a delete, roll forward to PIT:
+
+```sh
+db2 "rollforward db $STAGING_DB to <PIT_TIMESTAMP> using local time and stop"
+```
+
+If the scenario is object recovery from the backup image only and no PIT is needed, test whether end-of-logs is sufficient:
+
+```sh
+db2 "rollforward db $STAGING_DB to end of logs and stop"
+```
+
+Check status:
+
+```sh
+db2 rollforward db $STAGING_DB query status
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-18: Rollforward completed]`
+
+---
+
+### 9.6 Validate recovered objects/data in staging
+
+```sh
+db2 connect to $STAGING_DB
+
+db2 "select tabschema, tabname, tbspace from syscat.tables where tabschema='RCVLAB' order by tabname"
+db2 "select * from RCVLAB.T_RESTORE_A order by ID"
+db2 "select * from RCVLAB.T_RESTORE_B order by ID"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-19: Recovered data visible in staging DB]`
+
+---
+
+## 10. Export Recovered Data and Reinsert into Source UAT DB
+
+If the restore was done to staging, use export/import to place the recovered rows back into source UAT.
+
+### 10.1 Export from staging
+
+```sh
+mkdir -p $DATA_BASE/export
+
+db2 "export to $DATA_BASE/export/T_RESTORE_B.ixf of ixf select * from RCVLAB.T_RESTORE_B"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-20: Export from staging]`
+
+---
+
+### 10.2 Import into source DB
+
+```sh
+db2 connect to $DB_NAME
+
+db2 "import from $DATA_BASE/export/T_RESTORE_B.ixf of ixf replace into RCVLAB.T_RESTORE_B"
+```
+
+If the table no longer exists in source because it was dropped, recreate it first using the same DDL as earlier and then import.
+
+Validate:
+
+```sh
+db2 "select * from RCVLAB.T_RESTORE_B order by ID"
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-21: Data restored back to source UAT DB]`
+
+---
+
+## 11. Optional Comparison – Direct Restore Into Source DB
+
+This step is optional and should only be used if UAT allows direct recovery actions on the source database.
+
+### Important note
+
+A direct restore of a single tablespace into the source database can be more invasive and may require stricter coordination, depending on:
+
+- database state,
+- object dependencies,
+- availability requirements,
+- rollforward requirements,
+- whether the source tablespace still exists,
+- whether the objective is row recovery or full tablespace object recovery.
+
+### Practical recommendation
+
+For controlled validation, the **staging restore remains the preferred and lower-risk method**.
+
+Record the decision here:
+
+- **Direct source DB tablespace restore executed?** `<YES/NO>`
+- **If NO, reason:** `<change risk / availability / not needed / dependency concern>`
+
+---
+
+## 12. Post-Test Evidence Collection
+
+After completion, collect final evidence:
+
+```sh
+db2 connect to $DB_NAME
+db2 list history backup all for $DB_NAME
+
+db2 connect to $STAGING_DB
+db2 list history backup all for $STAGING_DB
+
+db2pd -db $DB_NAME -tablespaces
+db2pd -db $STAGING_DB -tablespaces
+```
+
+**Paste screenshot reference:**  
+`[SCREENSHOT-22: Final backup/recovery history and tablespace status]`
+
+---
+
+## 13. Final Validation Checklist
+
+Mark each item during execution.
+
+- [ ] UAT database inventory captured
+- [ ] Logging configuration captured
+- [ ] Tablespace inventory captured
+- [ ] Baseline backup completed
+- [ ] Dedicated test tablespace created
+- [ ] DEV-like test tables created on UAT
+- [ ] Sample rows inserted
+- [ ] Recovery backup completed
+- [ ] Loss scenario executed
+- [ ] Staging DB prepared
+- [ ] Single tablespace restore started successfully
+- [ ] Restore continued successfully
+- [ ] Rollforward completed
+- [ ] Recovered data validated in staging
+- [ ] Data exported/imported back to source if required
+- [ ] Final screenshots collected
+
+---
+
+## 14. Execution Notes / Real Values
+
+Fill in below during the real test:
+
+| Item | Value |
+|---|---|
+| Source UAT DB | `<DB_NAME>` |
+| Staging DB | `<STAGING_DB>` |
+| Restored tablespace | `<TS_NAME>` |
+| Tablespace ID | `<TS_ID>` |
+| Baseline backup timestamp | `<BACKUP_TIMESTAMP_BASELINE>` |
+| Recovery backup timestamp | `<BACKUP_TIMESTAMP_TEST>` |
+| PIT before delete | `<PIT_TIMESTAMP>` |
+| Restore type | `Tablespace restore to staging` |
+| Final result | `<SUCCESS / PARTIAL / FAILED>` |
+
+---
+
+## 15. Conclusions
+
+### Expected conclusion template
+
+The UAT validation confirmed that a **single tablespace restore** can be executed using a **staging database** approach. The test covered inventory collection, backup creation, DEV-like object creation, simulated loss, redirected tablespace restore, rollforward, and final data validation. The staging method proved to be the preferred operational model because it minimizes risk to the source UAT database while still enabling recovery of lost objects or rows.
+
+### Actual conclusion
+
+> Fill in after test execution.
+
+---
+
+## 16. Known Technical Notes
+
+1. In DB2 tablespace recovery work, the exact syntax order matters. In particular, `RESTORE` commands should keep `FROM` / `TAKEN AT` before `INTO`.
+2. If a tablespace does not yet exist in the staging restore context, `SET TABLESPACE CONTAINERS` may fail until the redirected restore has been initiated correctly.
+3. Row-level recovery is typically safest through **restore to staging + export/import**.
+4. Direct restore into the source DB may be possible in some cases, but it is operationally more sensitive and should not be the default test method.
+
+---
+
+## 17. Attachment Index Inside This Single File
+
+Use this section as the final index for screenshots inserted into the document:
+
+1. `[SCREENSHOT-01: DB directory and connection]`
+2. `[SCREENSHOT-02: Logging and recovery configuration]`
+3. `[SCREENSHOT-03: Tablespace inventory before test]`
+4. `[SCREENSHOT-04: Existing tablespace containers]`
+5. `[SCREENSHOT-05: Existing user tables]`
+6. `[SCREENSHOT-06: Backup history before test]`
+7. `[SCREENSHOT-07: db2pd/filesystem/backup locations]`
+8. `[SCREENSHOT-08: Baseline online full backup]`
+9. `[SCREENSHOT-09: Created UAT test tablespace]`
+10. `[SCREENSHOT-10: Tables created in target tablespace]`
+11. `[SCREENSHOT-11: Initial test data before recovery backup]`
+12. `[SCREENSHOT-12: Recovery backup containing the new tablespace]`
+13. `[SCREENSHOT-13: Data loss simulated by delete]` or `[SCREENSHOT-13B: Object loss simulated by drop]`
+14. `[SCREENSHOT-14: Staging DB prepared]`
+15. `[SCREENSHOT-15: Redirected tablespace restore started]`
+16. `[SCREENSHOT-16: Container mapping for restored tablespace]`
+17. `[SCREENSHOT-17: Restore continued successfully]`
+18. `[SCREENSHOT-18: Rollforward completed]`
+19. `[SCREENSHOT-19: Recovered data visible in staging DB]`
+20. `[SCREENSHOT-20: Export from staging]`
+21. `[SCREENSHOT-21: Data restored back to source UAT DB]`
+22. `[SCREENSHOT-22: Final backup/recovery history and tablespace status]`
+
+---
+
+## 18. Recommended Next Step
+
+Execute the commands step by step on UAT, replace placeholders with real values, and paste terminal screenshots directly into this same file after conversion to Word, or keep the markdown in GitHub as the master execution document.
