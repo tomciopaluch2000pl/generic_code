@@ -1,0 +1,93 @@
+db2 connect to ODLUGRA2
+
+db2 list tablespaces show detail
+db2 "select tbspaceid, tbsp_name, tbsp_type, pagesize, auto_storage from syscat.tablespaces order by tbspaceid"
+db2 "select bpname, pagesize, npages from syscat.bufferpools order by bpname"
+db2 list history backup all for ODLUGRA2
+db2 list applications for db ODLUGRA2
+df -g
+ls -ld /ars/data/db1
+
+mkdir -p /ars/logarch/ODLUGRA2/archive
+mkdir -p /ars/logarch/ODLUGRA2/active
+mkdir -p /ars/backup/ODLUGRA2/full
+mkdir -p /ars/backup/ODLUGRA2/inc
+mkdir -p /ars/stage/ODLUGR2S
+mkdir -p /ars/export/ODLUGRA2
+
+db2 update db cfg for ODLUGRA2 using LOGARCHMETH1 DISK:/ars/logarch/ODLUGRA2/archive
+db2 update db cfg for ODLUGRA2 using NEWLOGPATH /ars/logarch/ODLUGRA2/active
+db2 update db cfg for ODLUGRA2 using TRACKMOD YES
+
+db2 get db cfg for ODLUGRA2 | egrep 'LOGARCHMETH1|NEWLOGPATH|TRACKMOD|LOGFILSIZ|LOGPRIMARY|LOGSECOND'
+
+db2 force applications all
+db2 deactivate db ODLUGRA2
+db2 activate db ODLUGRA2
+db2 connect to ODLUGRA2
+
+db2 backup db ODLUGRA2 to /ars/backup/ODLUGRA2/full compress
+
+db2 list history backup all for ODLUGRA2
+
+db2 connect to ODLUGRA2
+db2 list tablespaces show detail
+db2 "select tbspaceid, tbsp_name, tbsp_type, pagesize, auto_storage from syscat.tablespaces order by tbspaceid"
+
+db2 backup db ODLUGRA2 online to /ars/backup/ODLUGRA2/full compress include logs
+
+db2 list history backup all for ODLUGRA2
+
+db2 connect to ODLUGRA2
+db2 "drop tablespace <TS_TO_REMOVE>"
+
+db2 list tablespaces show detail
+db2 "select tbspaceid, tbsp_name from syscat.tablespaces order by tbspaceid"
+
+db2 "select bpname, pagesize, npages from syscat.bufferpools order by bpname"
+
+db2 "create bufferpool BP32K_UAT immediate size 1000 pagesize 32k"
+
+mkdir -p /ars/data/db1/ODLUGRA2/TS_UAT_NEW1
+db2 "create regular tablespace TS_UAT_NEW1 pagesize 32k managed by database using (file '/ars/data/db1/ODLUGRA2/TS_UAT_NEW1/ts_uat_new1.cont' 20000) bufferpool BP32K_UAT"
+
+db2 "create table TEST_TS_UAT_NEW1 (ID int not null, NAME varchar(100), CRTS timestamp default current timestamp) in TS_UAT_NEW1"
+db2 "insert into TEST_TS_UAT_NEW1 (ID, NAME) values (1, 'ROW-1'), (2, 'ROW-2'), (3, 'ROW-3')"
+db2 commit
+db2 "select * from TEST_TS_UAT_NEW1 order by id"
+
+db2 backup db ODLUGRA2 online incremental to /ars/backup/ODLUGRA2/inc compress include logs
+
+db2 list history backup all for ODLUGRA2
+
+ODL2STG
+
+mkdir -p /ars/logarch/ODL2STG/archive
+mkdir -p /ars/logarch/ODL2STG/active
+mkdir -p /ars/data/db1/ODL2STG
+
+db2 "create db ODL2STG on /ars/data/db1"
+db2 update db cfg for ODL2STG using LOGARCHMETH1 DISK:/ars/logarch/ODL2STG/archive
+db2 update db cfg for ODL2STG using NEWLOGPATH /ars/logarch/ODL2STG/active
+db2 update db cfg for ODL2STG using TRACKMOD YES
+db2 backup db ODL2STG to /ars/backup/ODLUGRA2/full compress
+
+db2 restore db ODLUGRA2 tablespace (<TS_TO_REMOVE>) from /ars/backup/ODLUGRA2/full taken at <FULL_TS> into ODL2STG redirect
+
+mkdir -p /ars/data/db1/ODL2STG/<TS_TO_REMOVE>
+db2 "set tablespace containers for <TBSPACEID> using (file '/ars/data/db1/ODL2STG/<TS_TO_REMOVE>/<TS_TO_REMOVE>.cont' 20000)"
+
+db2 restore db ODLUGRA2 continue
+
+db2 rollforward db ODL2STG to end of logs and complete overflow log path (/ars/logarch/ODLUGRA2/archive)
+
+db2 connect to ODL2STG
+db2 "export to /ars/export/ODLUGRA2/recovered_ts.del of del select * from <RECOVERED_TABLE>"
+
+
+
+db2 list tablespaces show detail
+db2 "select tbspaceid, tbsp_name, tbsp_type, pagesize, auto_storage from syscat.tablespaces order by tbspaceid"
+db2 "select bpname, pagesize, npages from syscat.bufferpools order by bpname"
+df -g
+
