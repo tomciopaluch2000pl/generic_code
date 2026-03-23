@@ -1,0 +1,31 @@
+mkdir -p /ars/backup/ODLUGRA2/full_online
+mkdir -p /ars/data/db1/odadm/ODLUGRA2/UATTS1
+mkdir -p /ars/data/db2/odadm/ODLUGRA2/UATTS1
+
+db2 connect to ODLUGRA2
+
+db2 "select count(*) as ARSCAB_ROWS from ODADM.ARSCAB"
+
+db2 "select bpname, pagesize, npages from syscat.bufferpools order by bpname"
+
+db2 backup db ODLUGRA2 online to /ars/backup/ODLUGRA2/full_online compress include logs
+
+db2 list history backup all for ODLUGRA2
+
+db2 "drop tablespace ARSCABT"
+
+db2 "select tbspaceid, tbspace from syscat.tablespaces where tbspace = 'ARSCABT'"
+
+db2 "create regular tablespace ODLUAT1 pagesize 4k managed by database using (file '/ars/data/db1/odadm/ODLUGRA2/UATTS1/odluat1_01.cont' 20000, file '/ars/data/db2/odadm/ODLUGRA2/UATTS1/odluat1_02.cont' 20000) bufferpool IBMDEFAULTBP"
+
+db2 "create table ODADM.UAT_ARSCAB_REC (ID int not null, NAME varchar(100), CRTS timestamp default current timestamp) in ODLUAT1"
+
+db2 "insert into ODADM.UAT_ARSCAB_REC (ID, NAME) values (1,'ROW-1'),(2,'ROW-2'),(3,'ROW-3')"
+
+db2 commit
+
+db2 "select * from ODADM.UAT_ARSCAB_REC order by id"
+
+db2 backup db ODLUGRA2 online incremental to /ars/backup/ODLUGRA2/inc compress include logs
+
+db2 list history backup all for ODLUGRA2
