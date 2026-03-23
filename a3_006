@@ -1,0 +1,21 @@
+mkdir -p /ars/logarch/ODLUGRA2/archive
+mkdir -p /ars/logarch/ODLUGRA2/active
+mkdir -p /ars/backup/ODLUGRA2/full
+mkdir -p /ars/backup/ODLUGRA2/inc
+mkdir -p /ars/export/ODLUGRA2
+mkdir -p /ars/stage/ODL2STG
+
+db2 update db cfg for ODLUGRA2 using LOGARCHMETH1 DISK:/ars/logarch/ODLUGRA2/archive
+db2 update db cfg for ODLUGRA2 using NEWLOGPATH /ars/logarch/ODLUGRA2/active
+db2 update db cfg for ODLUGRA2 using TRACKMOD YES
+
+db2 get db cfg for ODLUGRA2 | egrep 'LOGARCHMETH1|NEWLOGPATH|TRACKMOD|LOGFILSIZ|LOGPRIMARY|LOGSECOND'
+
+db2 force applications all
+db2 deactivate db ODLUGRA2
+db2 activate db ODLUGRA2
+db2 connect to ODLUGRA2
+
+db2 backup db ODLUGRA2 to /ars/backup/ODLUGRA2/full compress
+
+db2 list history backup all for ODLUGRA2
