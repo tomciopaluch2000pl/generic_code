@@ -1,0 +1,23 @@
+mkdir -p /ars/logarch/ODL2STG/archive
+mkdir -p /ars/logarch/ODL2STG/active
+mkdir -p /ars/backup/ODL2STG/full
+mkdir -p /ars/data/db1/odadm/NODE0000/ODL2STG
+mkdir -p /ars/data/db2/odadm/NODE0000/ODL2STG
+mkdir -p /ars/data/db1/odadm/NODE0000/ODL2STG/T0000012
+mkdir -p /ars/data/db2/odadm/NODE0000/ODL2STG/T0000012
+
+db2 "create db ODL2STG on /ars/data/db1"
+
+db2 update db cfg for ODL2STG using LOGARCHMETH1 DISK:/ars/logarch/ODL2STG/archive
+db2 update db cfg for ODL2STG using NEWLOGPATH /ars/logarch/ODL2STG/active
+db2 update db cfg for ODL2STG using TRACKMOD YES
+
+db2 backup db ODL2STG to /ars/backup/ODL2STG/full compress
+
+db2 restore db ODLUGRA2 tablespace (ARSCABT) from /ars/backup/ODLUGRA2/full_online taken at 20260323132008 into ODL2STG redirect
+
+db2 "set tablespace containers for 12 using (file '/ars/data/db1/odadm/NODE0000/ODL2STG/T0000012/C0000000.LRG' 4096, file '/ars/data/db2/odadm/NODE0000/ODL2STG/T0000012/C0000001.LRG' 4096)"
+
+db2 restore db ODLUGRA2 continue
+
+db2 rollforward db ODL2STG to end of logs and complete overflow log path (/ars/logarch/ODLUGRA2/archive)
