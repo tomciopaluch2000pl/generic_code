@@ -1,0 +1,12 @@
+db2 connect to ODLUGRA2
+
+db2 list tablespaces show detail
+db2 "select tbspaceid, tbsp_name, tbsp_type, pagesize, auto_storage from syscat.tablespaces order by tbspaceid"
+db2 "select bpname, pagesize, npages from syscat.bufferpools order by bpname"
+db2 list history backup all for ODLUGRA2
+db2 get db cfg for ODLUGRA2 | egrep 'LOGARCHMETH1|NEWLOGPATH|TRACKMOD|LOGFILSIZ|LOGPRIMARY|LOGSECOND|AUTO_DEL_REC_OBJ|NUM_DB_BACKUPS|REC_HIS_RETENTN'
+df -g
+
+ls -ld /ars/data/db1
+ls -l /ars/data/db1
+
