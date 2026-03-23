@@ -1,0 +1,15 @@
+db2 connect to ODLUGRA2
+
+db2 "select tbspaceid, tbspace from syscat.tablespaces where tbspaceid = 12"
+
+db2 "select tabschema, tabname, type from syscat.tables where tbspaceid = 12 order by tabschema, tabname"
+
+db2 "select indschema, indname, tabschema, tabname from syscat.indexes where tabschema||'.'||tabname in (select tabschema||'.'||tabname from syscat.tables where tbspaceid = 12) order by indschema, indname"
+
+db2 list tablespace containers for 12 show detail
+
+db2 list history backup all for ODLUGRA2
+
+db2 get db cfg for ODLUGRA2 | egrep 'LOGARCHMETH1|NEWLOGPATH|TRACKMOD|LOGFILSIZ|LOGPRIMARY|LOGSECOND'
+
+db2 "select distinct t.tbspaceid, s.tbspace from syscat.tables t, syscat.tablespaces s where t.tbspaceid = s.tbspaceid order by t.tbspaceid"
