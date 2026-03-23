@@ -1,0 +1,13 @@
+hostname
+id
+ps -ef | egrep 'db2sysc|db2fmcd|db2wdog|arssockd' | grep -v grep
+db2level
+db2 get instance
+db2 list db directory
+db2 get db cfg for ODLUGRA2 | egrep 'LOGARCHMETH1|NEWLOGPATH|TRACKMOD|LOGFILSIZ|LOGPRIMARY|LOGSECOND'
+db2 list tablespaces show detail
+df -g
+
+db2 "select tbspaceid, tbsp_name, tbsp_type, pagesize, auto_storage from syscat.tablespaces order by tbspaceid"
+db2 "select bpname, pagesize, npages from syscat.bufferpools"
+db2 list history backup all for ODLUGRA2
