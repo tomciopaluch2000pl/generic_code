@@ -1,0 +1,17 @@
+db2 connect to ODLUGRA2
+
+db2 "select tbspaceid, tbspace from syscat.tablespaces where tbspace = 'ARSCABT'"
+
+db2 list history backup all for ODLUGRA2
+
+db2 "restore db ODLUGRA2 tablespace (ARSCABT) from /ars/backup/ODLUGRA2/full_online taken at 20260323132008"
+
+db2 "rollforward db ODLUGRA2 to end of logs and complete overflow log path (/ars/logarch/ODLUGRA2/archive)"
+
+db2 connect to ODLUGRA2
+
+db2 "select tbspaceid, tbspace from syscat.tablespaces where tbspace = 'ARSCABT'"
+
+db2 "select tabschema, tabname, type from syscat.tables where tbspaceid = 12 order by tabschema, tabname"
+
+db2 "select count(*) from ODADM.ARSCAB"
