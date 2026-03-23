@@ -1,0 +1,15 @@
+mkdir -p /ars/backup/ODLUGRA2/full_after_change
+
+db2 connect to ODLUGRA2
+
+db2 backup db ODLUGRA2 online to /ars/backup/ODLUGRA2/full_after_change compress include logs
+
+db2 "insert into ODADM.UAT_ARSCAB_REC (ID, NAME) values (4,'ROW-4')"
+
+db2 commit
+
+db2 "select * from ODADM.UAT_ARSCAB_REC order by id"
+
+db2 backup db ODLUGRA2 online incremental to /ars/backup/ODLUGRA2/inc compress include logs
+
+db2 list history backup all for ODLUGRA2
