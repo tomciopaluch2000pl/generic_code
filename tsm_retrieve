@@ -1,0 +1,109 @@
+#!/bin/bash
+###############################################################################
+# Script Name : tsm_retrieve_from_list.sh
+#
+# Description:
+#   Reads a text/CSV file with the following format:
+#     nodename,filespacename,llname
+#
+#   Example:
+#     NODE_A,/FILESYSTEM_A/ARCHIVE,OBJECT001
+#
+#   For each line, the script runs:
+#     dsmc retrieve <filespacename>/DOC/<llname> \
+#       -server=<server_name> \
+#       -virtualnode=<nodename> \
+#       -password=<password> \
+#       <target_root>/<filespacename_without_leading_slash>/<llname>
+###############################################################################
+
+set -u
+
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <input_file> <target_root>"
+    echo "Example:"
+    echo "  $0 input_objects.csv /restore/target"
+    exit 1
+fi
+
+INPUT_FILE="$1"
+TARGET_ROOT="$2"
+TSM_SERVER="ARCHIVE"
+
+LOG_FILE="./tsm_retrieve_$(date +%Y%m%d_%H%M%S).log"
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "ERROR: Input file not found: $INPUT_FILE"
+    exit 1
+fi
+
+if [ -z "${TSM_PASSWORD:-}" ]; then
+    echo "ERROR: TSM_PASSWORD environment variable is not set."
+    echo "Run first:"
+    echo "  export TSM_PASSWORD='your_password'"
+    exit 1
+fi
+
+mkdir -p "$TARGET_ROOT"
+
+echo "Started: $(date)" | tee -a "$LOG_FILE"
+echo "Input file : $INPUT_FILE" | tee -a "$LOG_FILE"
+echo "Target root: $TARGET_ROOT" | tee -a "$LOG_FILE"
+echo "TSM server : $TSM_SERVER" | tee -a "$LOG_FILE"
+echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+
+while IFS=',' read -r nodename filespacename llname
+do
+    nodename="$(echo "$nodename" | xargs)"
+    filespacename="$(echo "$filespacename" | xargs)"
+    llname="$(echo "$llname" | xargs)"
+
+    # Skip empty or invalid lines
+    if [ -z "$nodename" ] || [ -z "$filespacename" ] || [ -z "$llname" ]; then
+        continue
+    fi
+
+    # Skip optional header
+    if [ "$nodename" = "nodename" ]; then
+        continue
+    fi
+
+    source_object="${filespacename}/DOC/${llname}"
+
+    # Remove leading slash only for local filesystem target path
+    local_filespace="${filespacename#/}"
+
+    target_object="${TARGET_ROOT}/${local_filespace}/${llname}"
+    target_dir="$(dirname "$target_object")"
+
+    mkdir -p "$target_dir"
+
+    echo "Retrieving object:" | tee -a "$LOG_FILE"
+    echo "  Node   : $nodename" | tee -a "$LOG_FILE"
+    echo "  Source : $source_object" | tee -a "$LOG_FILE"
+    echo "  Target : $target_object" | tee -a "$LOG_FILE"
+
+    dsmc retrieve "$source_object" \
+        -server="$TSM_SERVER" \
+        -virtualnode="$nodename" \
+        -password="$TSM_PASSWORD" \
+        "$target_object" >> "$LOG_FILE" 2>&1
+
+    rc=$?
+
+    if [ $rc -eq 0 ]; then
+        echo "  Status : OK" | tee -a "$LOG_FILE"
+    else
+        echo "  Status : FAILED, RC=$rc" | tee -a "$LOG_FILE"
+    fi
+
+    echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+
+done < "$INPUT_FILE"
+
+echo "Finished: $(date)" | tee -a "$LOG_FILE"
+
+
+
+
+
