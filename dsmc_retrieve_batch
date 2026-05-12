@@ -1,0 +1,130 @@
+#!/bin/bash
+###############################################################################
+# Script Name : tsm_retrieve_batch_session.sh
+#
+# Description:
+#   Builds one dsmc command file from input CSV and runs all retrieve commands
+#   inside a single dsmc session.
+#
+# Input format:
+#   nodename,filespacename,llname
+#
+# Example:
+#   NODE_A,/FILESYSTEM_A/ARCHIVE,OBJECT001
+###############################################################################
+
+set -u
+
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <input_file> <target_root>"
+    echo "Example:"
+    echo "  $0 input_objects.csv /restore/target"
+    exit 1
+fi
+
+INPUT_FILE="$1"
+TARGET_ROOT="$2"
+TSM_SERVER="ARCHIVE"
+
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="./tsm_retrieve_batch_${RUN_ID}.log"
+CMD_FILE="./tsm_retrieve_commands_${RUN_ID}.cmd"
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "ERROR: Input file not found: $INPUT_FILE"
+    exit 1
+fi
+
+if [ -z "${TSM_PASSWORD:-}" ]; then
+    echo "ERROR: TSM_PASSWORD environment variable is not set."
+    echo "Run first:"
+    echo "  export TSM_PASSWORD='your_password'"
+    exit 1
+fi
+
+mkdir -p "$TARGET_ROOT"
+
+echo "Started: $(date)" | tee -a "$LOG_FILE"
+echo "Input file : $INPUT_FILE" | tee -a "$LOG_FILE"
+echo "Target root: $TARGET_ROOT" | tee -a "$LOG_FILE"
+echo "TSM server : $TSM_SERVER" | tee -a "$LOG_FILE"
+echo "Command file: $CMD_FILE" | tee -a "$LOG_FILE"
+echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+
+SESSION_NODE=""
+
+> "$CMD_FILE"
+
+counter=0
+
+while IFS=',' read -r nodename filespacename llname
+do
+    nodename="$(echo "$nodename" | tr -d '\r' | xargs)"
+    filespacename="$(echo "$filespacename" | tr -d '\r' | xargs)"
+    llname="$(echo "$llname" | tr -d '\r' | xargs)"
+
+    if [ -z "$nodename" ] || [ -z "$filespacename" ] || [ -z "$llname" ]; then
+        continue
+    fi
+
+    if [ "$nodename" = "nodename" ]; then
+        continue
+    fi
+
+    if [ -z "$SESSION_NODE" ]; then
+        SESSION_NODE="$nodename"
+    fi
+
+    if [ "$nodename" != "$SESSION_NODE" ]; then
+        echo "ERROR: More than one nodename found in input file." | tee -a "$LOG_FILE"
+        echo "First node : $SESSION_NODE" | tee -a "$LOG_FILE"
+        echo "Other node : $nodename" | tee -a "$LOG_FILE"
+        echo "Split the input file per node and run one batch per node." | tee -a "$LOG_FILE"
+        exit 1
+    fi
+
+    source_object="${filespacename%/}/DOC/${llname}"
+
+    local_filespace="${filespacename#/}"
+    local_filespace="${local_filespace%/}"
+
+    target_object="${TARGET_ROOT}/${local_filespace}/DOC/${llname}"
+    target_dir="$(dirname "$target_object")"
+
+    mkdir -p "$target_dir"
+
+    echo "retrieve \"${source_object}\" \"${target_object}\"" >> "$CMD_FILE"
+
+    counter=$((counter + 1))
+
+    if (( counter % 10000 == 0 )); then
+        echo "Prepared commands: $counter" | tee -a "$LOG_FILE"
+    fi
+
+done < "$INPUT_FILE"
+
+echo "quit" >> "$CMD_FILE"
+
+if [ -z "$SESSION_NODE" ]; then
+    echo "ERROR: No valid records found in input file." | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+echo "Prepared total commands: $counter" | tee -a "$LOG_FILE"
+echo "Using virtual node: $SESSION_NODE" | tee -a "$LOG_FILE"
+echo "Starting single dsmc session..." | tee -a "$LOG_FILE"
+echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+
+dsmc \
+    -server="$TSM_SERVER" \
+    -virtualnode="$SESSION_NODE" \
+    -password="$TSM_PASSWORD" \
+    < "$CMD_FILE" >> "$LOG_FILE" 2>&1
+
+rc=$?
+
+echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+echo "dsmc finished with RC=$rc" | tee -a "$LOG_FILE"
+echo "Finished: $(date)" | tee -a "$LOG_FILE"
+
+exit $rc
