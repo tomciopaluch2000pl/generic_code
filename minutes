@@ -1,0 +1,39 @@
+Hi all,
+
+A short summary of the outcome from today’s discussion with the Backup
+Team regarding the Storage Protect setup on p3lah002.
+
+The main decisions are:
+
+-   We have the green light to proceed with the installation of IBM
+    Storage Protect Server 8.1.25 on p3lah002.
+-   LA HUB will install four local Storage Protect server instances on
+    the AIX host as planned.
+-   This allows us to proceed with the APAC extract/insert migration as
+    the first migration step.
+-   The existing Backup Team setup on p3lah002 remains unchanged as part
+    of this migration:
+    -   SP Client 8.1.25
+    -   Storage Agent 8.1.25
+    -   Backup Team Storage Protect infrastructure
+
+For the future Storage Protect lifecycle upgrade, we agreed on a phased
+approach:
+
+-   Backup Team can upgrade its own Storage Protect infrastructure
+    independently.
+-   The local Storage Agent on p3lah002 will be upgraded separately
+    together with the local LA HUB Storage Protect Server installation.
+-   During any interim period where the local STA is not aligned with
+    the Backup Team SP server level, LAN-free backup through STA will
+    not be used.
+-   Required backups will continue via the SP Client over LAN until the
+    local STA and SP Server upgrade is completed.
+
+The immediate next step for LA HUB is therefore to proceed with the SP
+Server 8.1.25 installation on p3lah002 and continue preparation for the
+APAC migration.
+
+Thanks to the Backup Team for the support and alignment.
+
+Best regards, Krzysztof
