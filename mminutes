@@ -1,0 +1,20 @@
+LA HUB SP on AIX – Licensing & Ownership Alignment
+
+Participants: Vedran Milinovic, Krzysztof Stefaniak, Nagendra-Babu Billu-XT
+
+Agreed points
+
+IBM Storage Protect Server 8.1.25 has been successfully installed on AIX (p3lah002).
+The licensing package used by the four LA HUB SP Server instances will be replaced with the LA HUB/CDRM-owned package, keeping the local SP Server setup and licensing clearly on the LA HUB/CDRM side.
+APAC migration is planned for next weekend and will follow the standard change process. L2 will execute the operational steps with project SME support/shadowing.
+The APAC migration will also serve to validate and refine the procedure before the subsequent regional migrations.
+A short technical alignment with Norbert will be arranged to review the AIX architecture/setup.
+The immediate priority remains completion of the migrations and stabilization of the AIX environment. Future operational ownership/onboarding with the Backup Team will be addressed separately after the migration.
+
+Actions
+
+Action	Owner
+Replace current SP Server licensing package with LA HUB/CDRM package	Krzysztof
+Arrange short AIX architecture/setup review with Norbert	Krzysztof
+Prepare APAC change and execute migration with L2/SME support	Project Team
+Inform Oliver about the licensing-package adjustment	Krzysztof
