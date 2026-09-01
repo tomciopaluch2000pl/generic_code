@@ -1,0 +1,355 @@
+APAC IBM STORAGE PROTECT 8.1.25 – RHEL TO AIX MIGRATION Change Main
+Points + Technical Execution Notes
+================================================
+
+PURPOSE Migrate APAC IBM Storage Protect 8.1.25 from legacy RHEL host
+ODLPGRA1 to AIX host p3lah002 (instance splpgra1). Existing APAC archive
+data remains in the current HCP namespace. The SP database/configuration
+is migrated using EXTRACTDB / LOADFORMAT / INSERTDB. The RHEL source
+remains stopped and unchanged during target validation and is restarted
+only if backout is required.
+
+================================================ 1. MAIN POINTS FOR THE
+CHANGE RECORD ================================================
+
+1.  Pre-change readiness
+
+-   Verify splpgra1, AIX filesystems and capacity.
+-   Prepare dsmserv.opt, dsm.opt and dsm.sys.
+-   Securely prepare/copy dsmkeydb.kdb and dsmkeydb.sth.
+-   Prepare HCP certificate (hcp.arm / applicable certificate).
+-   Verify DNS and TLS/network connectivity from AIX to APAC HCP.
+
+2.  Source preparation
+
+-   Verify source DB/log/server health.
+-   Remove obsolete metadata for retired SnapLock storage.
+-   Remove obsolete storage pool after dependencies are cleared.
+-   Set ARCHIVERETENTIONPROTECTION ON and verify.
+
+3.  Recovery protection
+
+-   Perform a new FULL SP database backup.
+-   Save DEVCONFIG and VOLHISTORY.
+-   Confirm successful completion before continuing.
+
+4.  Freeze and PRE evidence
+
+-   DISABLE SESSIONS ALL and drain relevant sessions/processes.
+-   Generate complete, deterministically sorted ARCHIVES metadata
+    manifest.
+-   Generate SHA-256 fingerprint.
+-   Capture nodes, filespaces, occupancy, archive count and
+    damaged-object status.
+
+5.  Source stop and database extract
+
+-   Perform final source health check.
+-   HALT source server and record freeze timestamp.
+-   Run validated EXTRACTDB.
+-   Verify extract/manifest and generate transfer checksums.
+
+6.  Transfer to AIX
+
+-   SCP extract, manifest and checksum files to p3lah002.
+-   Verify file integrity before continuing.
+
+7.  Target database build
+
+-   Recheck target config, certificate and dsmkeydb files.
+-   Run DSMSERV LOADFORMAT.
+-   Run DSMSERV INSERTDB.
+-   Start splpgra1 without enabling production traffic.
+
+8.  Target validation
+
+-   Verify server/DB/log health and ACTLOG.
+-   Run VALIDATE CLOUD against existing APAC HCP.
+-   HCP validation failure = NO-GO.
+
+9.  Metadata reconciliation
+
+-   Generate POST ARCHIVES manifest using exactly the same SELECT/ORDER
+    BY as PRE.
+-   Compare PRE/POST counts, complete files and SHA-256 values.
+-   Compare nodes/filespaces/occupancy.
+-   Confirm no new damaged objects and retention protection remains ON.
+-   Any unexplained metadata difference = NO-GO.
+
+10. Application cutover [L3]
+
+-   Point APAC CMOD to new AIX SP endpoint.
+-   Enable required sessions.
+-   Test representative historical retrievals: CMOD -> AIX SP ->
+    existing HCP.
+-   Review sessions, ACTLOG and final server health.
+
+11. Completion [L3]
+
+-   Accept only after technical validation, 100% metadata reconciliation
+    and CMOD tests.
+-   Keep ODLPGRA1 stopped and unchanged.
+-   Decommissioning is outside this change.
+
+================================================ 2. DETAILED TECHNICAL
+EXECUTION ================================================
+
+PHASE A – TARGET READINESS [L3/L2]
+
+A1. Target environment [L3/L2]: su - splpgra1 id db2level
+
+A2. Capacity [L3/L2]: df -g
+
+Verify DB, active log, archive log, instance and staging capacity.
+
+A3. Configuration [L3/L2]: ls -la
+
+Verify: dsmserv.opt dsm.opt dsm.sys
+
+A4. Master encryption key files [L3]: dsmkeydb.kdb dsmkeydb.sth
+
+Verify: ls -la /dsmkeydb.*
+
+Handle as sensitive key material and preserve required
+ownership/permissions.
+
+A5. HCP certificate [L3/L2]: ls -la
+
+A6. DNS [L3/L2]: nslookup
+
+A7. Network/TLS [L3/L2]: curl -v https:///
+
+This is only connectivity validation. Storage Protect access is
+validated later with VALIDATE CLOUD.
+
+PHASE B – SOURCE CLEANUP AND HEALTH [L3; health/evidence queries may be
+L3/L2]
+
+B1. Capture [L3/L2]: q status q db f=d q log f=d q stgpool f=d q damaged
+
+B2. Identify obsolete SnapLock definitions [L3] using relevant APAC
+storage/container queries.
+
+B3. Remove obsolete metadata [L3]:
+
+B4. Remove obsolete pool [L3]:
+
+B5. Enable retention protection [L3]: set archiveretentionprotection on
+q status
+
+Expected: Archive Retention Protection = ON.
+
+PHASE C – RECOVERY PROTECTION [L3/L2]
+
+C1. Full DB backup [L3/L2]: backup db type=full devclass=
+
+C2. Verify [L3/L2]: q process q volhistory type=dbbackup
+
+Successful current full backup is a GO/NO-GO prerequisite.
+
+C3. DEVCONFIG [L3/L2]: backup devconfig
+filenames=/devconfig_APAC_pre_migration
+
+C4. VOLHISTORY [L3/L2]: backup volhistory
+filenames=/volhist_APAC_pre_migration
+
+PHASE D – FREEZE AND FINAL PRE EVIDENCE [L3/L2; L3 coordinates freeze]
+
+D1. Freeze new sessions [L3/L2; L3 coordinates]: disable sessions all
+
+D2. Drain/check [L3/L2]: q session q process
+
+D3. Total archive count [L3/L2]: select count(*) as TOTAL_ARCHIVES from
+archives
+
+D4. Determine final ARCHIVES manifest columns [L3 defines; L2 may
+execute]: select colname from syscat.columns where tabname=‘ARCHIVES’
+order by colno
+
+Create a complete PRE manifest using an approved SELECT with enough
+metadata to identify every archive object and a deterministic ORDER BY.
+
+Output: APAC_ARCHIVES_PRE.txt
+
+D5. Fingerprint [L3/L2]: sha256sum APAC_ARCHIVES_PRE.txt >
+APAC_ARCHIVES_PRE.sha256 wc -l APAC_ARCHIVES_PRE.txt
+
+D6. Nodes [L3/L2]: select node_name,domain_name from nodes order by
+node_name
+
+D7. Filespaces [L3/L2]: select node_name,filespace_name,filespace_id
+from filespaces order by node_name,filespace_name,filespace_id
+
+D8. Additional evidence [L3/L2]: q occupancy q damaged
+
+D9. Final source check [L3/L2]: q session q process q db f=d q log f=d
+
+PHASE E – SOURCE STOP AND EXTRACT [L3]
+
+E1. Stop [L3]: halt
+
+Record exact SOURCE FREEZE TIMESTAMP.
+
+IMPORTANT: ODLPGRA1 must not be restarted after this point unless
+Backout is invoked.
+
+E2. Extract [L3]:
+
+Expected: - successful EXTRACTDB - extract files and manifest produced -
+no fatal/failed migration messages
+
+E3. Verify [L3/L2]: ls -lh
+
+E4. Checksums [L3/L2]: sha256sum > APAC_EXTRACT.sha256
+
+PHASE F – TRANSFER TO AIX [L3/L2]
+
+F1. Transfer [L3/L2]: scp splpgra1@p3lah002:/
+
+F2. Transfer manifest/checksums [L3/L2]: scp APAC_EXTRACT.sha256
+splpgra1@p3lah002:/
+
+F3. Validate on AIX [L3/L2]: cd sha256sum -c APAC_EXTRACT.sha256
+
+All files must validate. Failure = NO-GO.
+
+PHASE G – TARGET DATABASE BUILD [L3]
+
+G1. Recheck [L3/L2]: su - splpgra1 df -g ls -la ls -la /dsmkeydb.* ls
+-la ls -lh
+
+G2. LOADFORMAT [L3]: dsmserv loadformat dbdir= activelogsize=
+activelogdirectory= archlogdirectory=
+
+Add mirror/failover log parameters if applicable. Exact paths/size must
+be validated before CAB.
+
+G3. INSERTDB [L3]: dsmserv insertdb manifest=
+
+Use syntax validated for the actual EXTRACTDB method. Expected:
+successful INSERTDB with no failed objects.
+
+PHASE H – FIRST START / HCP VALIDATION [L3/L2; L3 owns decision]
+
+H1. Start [L3/L2]:
+
+Do not enable production traffic yet.
+
+H2. Verify [L3/L2]: q status q db f=d q log f=d q process q stgpool f=d
+q damaged
+
+H3. ACTLOG [L3/L2]: q actlog begindate=today
+
+H4. HCP [L3/L2]: validate cloud stgpool= or applicable cloud-connection
+form.
+
+Successful HCP validation is mandatory. Failure = NO-GO.
+
+PHASE I – POST METADATA RECONCILIATION [L3/L2; L3 owns Go/No-Go]
+
+Production remains blocked.
+
+I1. POST total [L3/L2]: select count(*) as TOTAL_ARCHIVES from archives
+
+I2. Generate [L3/L2]: APAC_ARCHIVES_POST.txt
+
+Use EXACTLY the same SELECT and ORDER BY as PRE.
+
+I3. Fingerprint [L3/L2]: sha256sum APAC_ARCHIVES_POST.txt >
+APAC_ARCHIVES_POST.sha256
+
+I4. Full comparison [L3/L2]: diff APAC_ARCHIVES_PRE.txt
+APAC_ARCHIVES_POST.txt
+
+Expected: no output, RC=0.
+
+I5. Hash comparison [L3/L2]: sha256sum APAC_ARCHIVES_PRE.txt
+APAC_ARCHIVES_POST.txt
+
+Expected: identical SHA-256.
+
+I6. Repeat nodes query and compare with PRE. [L3/L2]
+
+I7. Repeat filespaces query and compare with PRE. [L3/L2]
+
+I8. Capture [L3/L2]: q occupancy q damaged q status
+
+Expected: - metadata reconciles - no new damaged objects - Archive
+Retention Protection = ON
+
+Any unexplained ARCHIVES manifest difference = NO-GO.
+
+PHASE J – CMOD CUTOVER / APPLICATION TEST [L3]
+
+J1. Switch CMOD [L3]:
+
+J2. Enable sessions [L3/L2; after L3 Go]: enable sessions all
+
+J3. Retrieve predefined historical APAC objects [L3/L2]: CMOD ->
+splpgra1/p3lah002 -> existing APAC HCP
+
+Use representative objects across dates/applications.
+
+J4. Verify [L3/L2]: q session q actlog begindate=today
+
+J5. Final [L3/L2; L3 accepts]: q status q db f=d q log f=d q damaged
+
+================================================ 3. ACCEPTANCE CRITERIA
+
+[ ] Full DB backup successful [ ] DEVCONFIG and VOLHISTORY saved [ ]
+Source frozen cleanly [ ] EXTRACTDB successful [ ] Transfer checksums
+successful [ ] LOADFORMAT successful [ ] INSERTDB successful [ ] Target
+SP starts successfully [ ] VALIDATE CLOUD successful [ ] PRE/POST
+archive counts match [ ] Complete PRE/POST ARCHIVES manifests are
+identical [ ] PRE/POST SHA-256 values are identical [ ] Nodes/filespaces
+reconcile [ ] No new damaged objects [ ] Archive Retention Protection =
+ON [ ] CMOD historical retrieval successful [ ] No unexpected critical
+ACTLOG errors
+
+================================================ 4. BACKOUT PLAN
+
+Backout ownership: L3 coordinates and owns the rollback decision.
+Individual verification and instance-owner tasks may be executed by L2
+when explicitly directed by L3.
+
+Invoke backout if mandatory technical validation, metadata
+reconciliation or application validation fails before final acceptance.
+
+1.  Block target: disable sessions all
+
+2.  Stop target: halt or
+
+3.  Restore CMOD endpoint:
+
+4.  Start ODLPGRA1:
+
+5.  Validate: q status q db f=d q log f=d q stgpool f=d
+
+6.  Restore access: enable sessions all
+
+7.  Test historical CMOD retrieval through original RHEL SP.
+
+8.  Review: q actlog begindate=today
+
+9.  Record rollback evidence.
+
+Backout principle: The source remains stopped and unchanged throughout
+target build/validation and is restarted only when backout is invoked.
+This preserves the pre-migration source state.
+
+================================================ 5. ITEMS TO FINALIZE
+WITH TECHNICAL TEAM ================================================
+
+1.  Exact obsolete SnapLock delete commands.
+2.  Exact APAC HCP FQDN/path/certificate handling.
+3.  Final ARCHIVES columns and deterministic PRE/POST SELECT.
+4.  Exact DSMUPGRD EXTRACTDB command.
+5.  Extract device/files/manifest locations.
+6.  Exact AIX DB/log/instance/staging paths.
+7.  Exact DSMSERV LOADFORMAT command and ACTIVELOGSIZE.
+8.  Exact DSMSERV INSERTDB command.
+9.  Exact splpgra1 start/stop procedure.
+10. Exact HCP pool/cloud-connection name for VALIDATE CLOUD.
+11. Exact CMOD endpoint switch.
+12. Predefined CMOD retrieval-test objects.
+13. Expected EXTRACTDB, SCP and INSERTDB durations / overall timeline.
