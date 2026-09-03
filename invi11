@@ -1,0 +1,22 @@
+Hi David, Hitendra and team,
+
+Following the federation of Storage Protect data into single regional instances, we are preparing to remove the redundant source data from the HCP namespaces in AMER and EMEA.
+
+After the cleanup, the remaining data volumes — and consequently tenant utilization — will differ significantly across the four HCP nodes in each region. The retained data will be used as cold storage, with no further ingestion planned into these legacy tenants.
+
+The purpose of this meeting is to review the attached before-and-after utilization figures and confirm:
+
+* How the HCP usage is charged: actual stored data, tenant hard quota, or another capacity metric.
+* Whether the projected asymmetric tenant utilization is acceptable.
+* Whether tenant allocations can or should be resized without moving data.
+* Whether unequal utilization of our tenants could affect other tenants or node-level capacity, routing, or performance.
+* Whether any data redistribution is actually required.
+
+The expected outcome is confirmation of the billable capacity after cleanup and an agreed action — or confirmation that no further action is required.
+
+Please feel free to forward the invitation or add any additional HCP NGA Storage SME who should participate.
+
+The presentation is attached for reference.
+
+Thanks,
+Krzysztof
