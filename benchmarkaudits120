@@ -1,0 +1,325 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""Time-bounded pool audits. Invoked through sp_hcp_audit.py benchmark POOL.
+
+This module measures progress counters, not full audit integrity. One pool-wide
+WAIT=NO command starts each trial. Its returned parent process ID is recorded
+before polling. Only that verified parent can be cancelled; no wildcard or
+worker cancellation is used. The next trial requires all audits to have stopped.
+"""
+from __future__ import print_function, unicode_literals
+import getpass
+import json
+import math
+import os
+import re
+import resource
+import sys
+import time
+import sp_hcp_audit as t
+
+START = re.compile(r"ANS8003I\s+Process number\s+(\d+)\s+started",re.I)
+FIELDS = ["trial","maxprocess","status","eligible","sample_seconds","completed_containers",
+          "failed_containers","containers_per_hour","containers_per_configured_process",
+          "containers_per_hour_per_configured_process","estimated_full_pool_seconds",
+          "estimated_full_pool_hms","estimated_remaining_seconds","parent_process_id",
+          "requested_seconds","cancellation_and_settle_seconds","reasons"]
+
+
+def pause(seconds):
+    # Short sleeps permit signal handling even during a long cooldown.
+    end = t.CLOCK()+seconds
+    while t.CLOCK()<end:
+        time.sleep(min(1.0,max(0.0,end-t.CLOCK())))
+
+
+def processes(admin):
+    """One LIST query gives parent progress and all visible worker processes."""
+    result = admin.run("QUERY PROCESS","benchmark_processes",allow_empty=True,timeout=60)
+    records = list(t.details(result["path"],"Process Number"))
+    if not records and not result["explicit_no_match"]:
+        raise t.ToolError("Unrecognized QUERY PROCESS output; stopping benchmark.")
+    found = {}
+    for record in records:
+        pid = str(t.counter(record["Process Number"]))
+        if pid in found or not record.get("Process Description"):
+            raise t.ToolError("Duplicate or incomplete process record.")
+        found[pid] = record
+    return found
+
+
+def audits(records):
+    return dict((pid,r) for pid,r in records.items()
+                if re.search(r"audit\s+container",r["Process Description"],re.I))
+
+
+def parent_status(record,pool):
+    # Workers mention a container and its pool too. Require the parent's exact
+    # description and the 'Storage pool NAME,' prefix before permitting cancel.
+    status = record.get("Process Status",record.get("Status",""))
+    if (record.get("Process Description","").strip().upper()!="AUDIT CONTAINER" or
+            not re.match(r"^Storage pool\s+"+re.escape(pool)+r"\s*,",status,re.I)):
+        raise t.ToolError("Parent process identity/pool mismatch; no cancellation sent.")
+    return status
+
+
+def progress(record,pool):
+    status = parent_status(record,pool)
+    values = []
+    for label in ("Total number of containers","Successfully audited containers","Failed audited containers"):
+        match = re.search(re.escape(label)+r"\s*:\s*([\d,]+)",status,re.I)
+        if not match:
+            raise t.ToolError("Unrecognized parent progress counters; raw output retained.")
+        values.append(t.counter(match.group(1).rstrip(",")))
+    if values[1]+values[2]>values[0]:
+        raise t.ToolError("Inconsistent audit progress counters.")
+    return values
+
+
+def stop_owned(admin,pid,pool,settle_seconds):
+    """Verify ownership scope, request cancellation once and observe quiescence.
+
+    A successful CANCEL response is not proof that workers have stopped. Wait
+    for their disappearance. Never cancel another audit that appears meanwhile.
+    """
+    began = t.CLOCK()
+    visible = processes(admin)
+    if pid in visible:
+        parent_status(visible[pid],pool)
+        admin.run("CANCEL PROCESS "+pid,"benchmark_cancel_owned_parent",require=False,timeout=60)
+    while True:
+        visible = processes(admin)
+        if not audits(visible):
+            return round(t.CLOCK()-began,6)
+        if t.CLOCK()-began>=settle_seconds:
+            raise t.ToolError("Audit processes remain after cancellation; no next trial. Inspect QUERY PROCESS.")
+        pause(min(2.0,settle_seconds))
+
+
+def metrics(completed,seconds,total,mp):
+    """Extrapolate count throughput; no claim that containers cost equal work."""
+    rate = completed/float(seconds) if seconds>0 else 0
+    full = total/rate if rate>0 else None
+    return {"containers_per_hour":round(rate*3600,3),
+            "containers_per_configured_process":round(completed/float(mp),3),
+            "containers_per_hour_per_configured_process":round(rate*3600/mp,3),
+            "estimated_full_pool_seconds":round(full,3) if full is not None else None,
+            "estimated_full_pool_hms":t.duration_hms(full) if full is not None else None,
+            "estimated_remaining_seconds":round(max(0,total-completed)/rate,3) if rate>0 else None}
+
+
+def recommendation(rows,tolerance):
+    # If a limit is repeated, use its slowest eligible sample. This avoids
+    # cherry-picking the warmest/fastest repeat. Not a confidence interval.
+    grouped = {}
+    for row in rows:
+        if row.get("eligible"):
+            grouped.setdefault(row["maxprocess"],[]).append(row["containers_per_hour"])
+    if not grouped:
+        return {"recommended_maxprocess":None,"reason":"NO_ELIGIBLE_SAMPLES"}
+    conservative = dict((mp,min(rates)) for mp,rates in grouped.items())
+    best = max(conservative.values())
+    choices = [mp for mp,rate in conservative.items() if rate>=best/(1+tolerance/100.0)]
+    chosen = min(choices)
+    return {"recommended_maxprocess":chosen,"tolerance_percent":tolerance,
+            "estimated_duration_penalty_percent":round((best/conservative[chosen]-1)*100,3),
+            "fastest_observed_maxprocess":min(mp for mp,rate in conservative.items() if rate==best),
+            "basis":"Smallest tested limit within tolerance of best estimated duration; slowest sample per repeated limit",
+            "resource_load_measured":False}
+
+
+def save(root,run):
+    """Checkpoint after every observation/trial; partial runs remain reviewable."""
+    t.write_json(os.path.join(root,"benchmark_result.json"),run)
+    rows = run["trials"]
+    t.export_csv(os.path.join(root,"benchmark_trials.csv"),FIELDS,
+                 ([r.get(k) for k in FIELDS] for r in rows))
+    lines = ["IBM STORAGE PROTECT AUDIT PERFORMANCE SAMPLE", "Tool version: "+t.VERSION,
+             "Server: "+run.get("server_name","UNKNOWN"),"Pool: "+run["pool"],
+             "Status: "+run["status"],"Validation: "+run["validate_cloud_extents"],
+             "THIS IS NOT A FULL AUDIT OR NAMESPACE-DELETION EVIDENCE.",""]
+    for row in rows:
+        lines.append("Trial {trial}: MAXPROCESS={maxprocess}; {status}; completed={completed_containers}; elapsed={sample_seconds:.1f}s; containers/hour={containers_per_hour}; estimated full pool={estimated_full_pool_hms}; eligible={eligible}".format(**row))
+    rec = run.get("recommendation",{})
+    lines += ["", "Suggested tested MAXPROCESS: "+str(rec.get("recommended_maxprocess")),
+              "Selection basis: "+rec.get("basis",rec.get("reason","Not evaluated")),
+              "Estimate assumes the sampled containers represent the remaining pool.",
+              "Repeated SCANALL runs can revisit the same containers and benefit from cache.",
+              "Configured-process efficiency is a nominal ratio, not measured worker utilization.",
+              "CPU, memory, DB pressure, HCP latency and crash risk are not measured.",
+              "Cancellation/settling and setup extend total runtime beyond the sample windows."]
+    if run.get("error"):
+        lines += ["ERROR: "+run["error"],"Check active_parent_process_id and QUERY PROCESS before another run."]
+    t.write_text(os.path.join(root,"REPORT.txt"),"\n".join(lines)+"\n")
+
+
+def trial(admin,args,root,run,mp,index,total):
+    """Measure successful parent counters up to the requested observation time."""
+    if audits(processes(admin)):
+        raise t.ToolError("An audit is already active; no benchmark trial submitted.")
+    command = t.audit_command(args.pool,mp,args.validate_cloud_extents).replace("WAIT=YES","WAIT=NO")
+    state = {"trial":index,"maxprocess":mp,"command":command,"started_utc":t.now(),"observations":[]}
+    path = os.path.join(root,"trial_{:02d}.json".format(index))
+    run["submission_outcome"] = "SUBMITTING_OUTCOME_UNKNOWN"
+    save(root,run)
+    began = t.CLOCK()
+    response = admin.run(command,"benchmark_start",timeout=60,require=False)
+    ids = START.findall(t.read_text(response["path"]))
+    if len(set(ids))!=1:
+        raise t.ToolError("No unique ANS8003I parent ID; submission outcome unknown. No retry or guessed cancellation.")
+    pid = ids[0]
+    run["active_parent_process_id"] = pid
+    run["submission_outcome"] = "PARENT_IDENTIFIED"
+    save(root,run)
+    if not response["ok"] or response["warnings"]:
+        raise t.ToolError("Benchmark submission reported an error/warning; stopping owned audit.")
+    last_done,last_failed,elapsed = 0,0,0.0
+    status,reasons = "TIMED_SAMPLE",[]
+    while True:
+        records = processes(admin)
+        elapsed = t.CLOCK()-began
+        if pid not in records:
+            # A vanished process is not a final success counter. Retain the
+            # last observation, but exclude this run from automatic selection.
+            status = "ENDED_WITHOUT_FINAL_COUNTERS"
+            reasons.append(status)
+            break
+        observed_total,done,failed = progress(records[pid],args.pool)
+        if observed_total!=total or done<last_done or failed<last_failed:
+            raise t.ToolError("Pool count/progress changed unexpectedly; sample rejected.")
+        last_done,last_failed = done,failed
+        linked_workers = sum(1 for other,r in audits(records).items() if other!=pid and
+                             r.get("Parent Process",r.get("Parent Process Number",""))==pid)
+        state["observations"].append({"elapsed_seconds":round(elapsed,6),"completed":done,"failed":failed,
+                                      "linked_workers_visible":linked_workers or None})
+        t.write_json(path,state)
+        t.say("Benchmark {}/{}: MAXPROCESS={}, elapsed={}, completed={}/{}, rate={:.1f}/hour".format(
+            index,len(args.process_list),mp,t.duration_hms(elapsed),done,total,done*3600/elapsed if elapsed else 0))
+        if failed:
+            reasons.append("FAILED_CONTAINER_COUNTER_NONZERO")
+            break
+        if done==total:
+            status = "POOL_COMPLETION_COUNTER_OBSERVED"
+            break
+        if elapsed>=args.minutes*60:
+            break
+        pause(min(args.poll_seconds,max(0,args.minutes*60-elapsed)))
+    # Use the timestamp belonging to the counter, not time after cancellation.
+    observed_seconds = state["observations"][-1]["elapsed_seconds"] if state["observations"] else elapsed
+    settle = stop_owned(admin,pid,args.pool,args.settle_seconds)
+    run["active_parent_process_id"] = None
+    run["submission_outcome"] = "STOP_OBSERVED"
+    post = t.damaged(admin,args.pool,"benchmark_damage_after")
+    if any(post.get(k) is None or post.get(k)!=0 for k in ("non_dedup","dedup","orphaned")):
+        reasons.append("POST_SAMPLE_DAMAGE_OR_UNKNOWN_COUNTERS")
+    count = t.bulk_container_counts(admin,[args.pool],"benchmark_count_after").get(args.pool,0)
+    if count!=total:
+        reasons.append("POOL_CONTAINER_COUNT_CHANGED")
+    if last_done<args.min_containers:
+        reasons.append("INSUFFICIENT_COMPLETED_CONTAINERS")
+    result = dict(trial=index,maxprocess=mp,status=status,eligible=not reasons,
+                  sample_seconds=observed_seconds,completed_containers=last_done,failed_containers=last_failed,
+                  parent_process_id=pid,requested_seconds=args.minutes*60,cancellation_and_settle_seconds=settle,
+                  reasons=";".join(reasons),after_damage=post)
+    result.update(metrics(last_done,observed_seconds,total,mp))
+    state["result"] = result
+    t.write_json(path,state)
+    return result
+
+
+def run(args):
+    """Prompt once, inventory once, run selected limits sequentially, then compare."""
+    if not args.pool or args.candidates:
+        raise t.ToolError("Benchmark requires one pool and does not accept --candidates.")
+    t.pool_arg(args.pool)
+    try:
+        args.process_list = [int(x.strip()) for x in args.processes.split(",")]
+    except ValueError:
+        raise t.ToolError("--processes must be comma-separated integers from 1 to 99.")
+    if not args.process_list or any(x<1 or x>99 for x in args.process_list):
+        raise t.ToolError("Process limits must be 1-99.")
+    values = [args.minutes,args.poll_seconds,args.settle_seconds,args.cooldown_seconds,args.tolerance_percent]
+    if any(math.isnan(x) or math.isinf(x) for x in values) or min(values)<0:
+        raise t.ToolError("Benchmark durations/tolerance must be finite and nonnegative.")
+    if min(args.minutes,args.poll_seconds,args.settle_seconds)<=0 or args.min_containers<1:
+        raise t.ToolError("Sample duration, polling, settling and minimum containers must be positive.")
+    if args.connect_timeout<1 or args.query_timeout<0:
+        raise t.ToolError("Invalid connection/query timeout.")
+    args.dsmadmc = t.executable(args.dsmadmc)
+    if not sys.stdin.isatty():
+        raise t.ToolError("Run from a terminal for the ID/password prompts.")
+    os.umask(0o077)
+    resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+    username = (raw_input("dsmadmc login: ") if t.PY2 else input("dsmadmc login: ")).strip()
+    password = getpass.getpass("dsmadmc password: ")
+    if not username or not password:
+        raise t.ToolError("ID/password cannot be empty.")
+    root = os.path.abspath(args.out or "sp_hcp_benchmark_{}_{}".format(time.strftime("%Y%m%dT%H%M%SZ",time.gmtime()),os.getpid()))
+    os.mkdir(root,0o700)
+    os.mkdir(os.path.join(root,"raw"),0o700)
+    admin,db = None,None
+    run = {"tool_version":t.VERSION,"status":"PREPARING","pool":args.pool,"trials":[],
+           "started_utc":t.now(),"validate_cloud_extents":args.validate_cloud_extents,
+           "process_limits":args.process_list,"minutes_per_trial":args.minutes,
+           "active_parent_process_id":None,"namespace_deletion_assessed":False}
+    save(root,run)
+    try:
+        admin = t.Admin(args,root,username,password)
+        password = None
+        config = t.configuration(admin,"initial")
+        t.write_json(os.path.join(root,"configuration.json"),config)
+        matches = [p for p in config["pools"] if p.upper()==args.pool.upper()]
+        if len(matches)!=1 or config["server_name"]==t.UNKNOWN:
+            raise t.ToolError("Pool/server identity not resolved.")
+        args.pool = matches[0]
+        run.update(pool=args.pool,server_name=config["server_name"])
+        conn = config["connections"].get(config["pools"][args.pool].get("Connection Name","").upper(),{})
+        if conn.get("Cloud Type","").upper()!="S3":
+            raise t.ToolError("This benchmark requires an S3 cloud pool.")
+        db = t.new_database(root)
+        snapshot = t.capture_snapshot(admin,db,root,"before",config,[args.pool])
+        if snapshot["issues"]:
+            raise t.ToolError("Initial inventory requires review; no benchmark submitted.")
+        total = snapshot["pools"][args.pool]["parsed"]
+        if total==0:
+            raise t.ToolError("Pool is empty; no performance sample possible.")
+        damage = t.damaged(admin,args.pool,"benchmark_damage_before")
+        if any(damage.get(k) is None or damage.get(k)!=0 for k in ("non_dedup","dedup","orphaned")):
+            raise t.ToolError("Review existing damage/unknown counters before performance trials.")
+        run.update(status="SAMPLING",total_containers=total,before_damage=damage)
+        for index,mp in enumerate(args.process_list,1):
+            row = trial(admin,args,root,run,mp,index,total)
+            run["trials"].append(row)
+            run["recommendation"] = recommendation(run["trials"],args.tolerance_percent)
+            save(root,run)
+            if not row["eligible"]:
+                run["status"] = "STOPPED_REVIEW_REQUIRED"
+                break
+            if index<len(args.process_list):
+                pause(args.cooldown_seconds)
+        else:
+            run["status"] = "PERFORMANCE_SAMPLES_COLLECTED"
+        run["ended_utc"] = t.now()
+        save(root,run)
+        t.say("Benchmark report: "+os.path.join(root,"REPORT.txt"))
+        return 0 if run["status"]=="PERFORMANCE_SAMPLES_COLLECTED" else 2
+    except BaseException as exc:
+        run.update(status="INCOMPLETE_REVIEW_REQUIRED",error=t.TEXT(exc) or type(exc).__name__)
+        pid = run.get("active_parent_process_id")
+        if admin and pid:
+            try:
+                stop_owned(admin,pid,args.pool,args.settle_seconds)
+                run["active_parent_process_id"] = None
+                run["cleanup"] = "STOP_OBSERVED"
+            except BaseException as cleanup:
+                run["cleanup"] = "UNKNOWN: "+t.TEXT(cleanup)
+        save(root,run)
+        t.say("Incomplete benchmark retained at: "+root)
+        raise
+    finally:
+        if db:
+            db.close()
+        if admin:
+            admin.close()
+            admin.write_profile()
+        t.manifest(root)
