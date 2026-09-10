@@ -1,0 +1,235 @@
+#!/bin/sh
+# SP SSH pairing wizard 2.0.0. RHEL/AIX; run as the instance owner, NOT root.
+# Only public keys cross hosts. No account/sshd policy changes, no SP commands.
+set -eu
+set -f
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/openssh/bin:/usr/openssh/sbin
+export PATH
+LC_ALL=C; export LC_ALL
+umask 077
+fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+ask() { printf '%s: ' "$1"; IFS= read -r ANSWER || fail 'Input ended'; }
+safe() { case "$1" in ''|*[!A-Za-z0-9_./-]*) fail "Unsupported path/name: $1";; esac; }
+filecheck() {
+ [ ! -L "$1" ] || fail "Symlink refused: $1"
+ if [ -e "$1" ]; then
+  [ -f "$1" ] && [ -O "$1" ] || fail "Not a regular file owned by you: $1"
+  [ "$(ls -ld "$1" | awk '{print $2}')" = 1 ] || fail "Hardlink refused: $1"
+ fi
+}
+help() {
+cat <<'HELP'
+SP SSH pairing wizard 2.0.0
+Usage: sh sp_ssh_setup.sh [source|target|finish|diagnose] [expected-local-user]
+No arguments opens a menu. Run as the instance owner on EACH host, not root.
+The optional username checks the current identity; it does not switch users.
+
+1. SOURCE: create/reuse a dedicated key for one target name/user/port.
+2. TARGET: append pasted source PUBLIC key to your authorized_keys.
+3. SOURCE finish: paste target HOST PUBLIC key, configure ~/.ssh/config,
+   test public-key login and an optional ordinary scp upload/download.
+Then: scp /path/file remoteuser@target:/path/directory/
+No -i or special options required. Use the EXACT configured target spelling.
+The source can also pull files using ordinary scp. To INITIATE connections
+from the other host, repeat the workflow with source and target reversed.
+
+OpenSSH must be installed. Default target authorized_keys location is assumed
+unless you supply an administrator-confirmed alternative. No root is needed
+when accounts already allow SSH and own writable homes/.ssh directories.
+Locked accounts, SSH/PAM/PowerBroker policy, custom sshd setup, ACLs, SELinux,
+NFS permissions and SFTP availability may require an administrator.
+The wizard does not unlock accounts, disable SELinux or weaken algorithms.
+Use diagnose on either host if login fails; inspect server logs with admin.
+
+Existing keys are preserved. Config is backed up and a host-specific block
+is prepended (it intentionally wins for that host). Existing config bytes
+remain after a Host * reset. IdentityFile entries may accumulate in OpenSSH.
+Do not edit SSH files concurrently. Each run serializes other wizard runs.
+Partial work is retained on failure so setup can be resumed. Failed probes
+may leave their printed temporary paths; no migration data is ever deleted.
+
+Rollback: remove the marked SP-PAIR block from source ~/.ssh/config and only
+this public-key line from target authorized_keys. Remove the printed pair
+folder after the access is no longer needed. Do not blindly restore backups
+if other edits have been made since. Private key never leaves source.
+HELP
+}
+MODE=${1:-menu}
+case "$MODE" in -h|--help|help) help; exit 0;; esac
+U=$(id -un); UIDNUM=$(id -u)
+[ "$UIDNUM" != 0 ] || fail 'Switch to the instance owner with your PowerBroker role, then run again.'
+[ "${2:-$U}" = "$U" ] || fail "Current user is $U; switch to ${2} first"
+OS=$(uname -s)
+case "$OS" in
+ AIX) H=$(lsuser -a home "$U" | sed 's/^[^ ]* home=//');;
+ Linux) H=$(getent passwd "$U" | awk -F: 'NR==1 {print $6}');;
+ *) fail "Unsupported OS: $OS";;
+esac
+safe "$H"; case "$H" in /|*/../*|*/./*) fail 'Unusual home path; needs review';; /*) :;; *) fail 'Home not absolute';; esac
+[ -d "$H" ] || fail "Home missing: $H"
+# OpenSSH uses the account database home. Do not rely on inherited root HOME.
+printf 'Host=%s OS=%s Account=%s Home=%s\n' "$(hostname)" "$OS" "$U" "$H"
+D="$H/.ssh"; C="$D/config"; LOCK=''
+cleanup() { if [ -n "$LOCK" ]; then rmdir "$LOCK" 2>/dev/null || :; fi; }
+trap cleanup 0
+trap 'exit 130' 1 2 15
+if [ "$MODE" = menu ]; then
+ printf '\n1 Source: create key\n2 Target: import key\n3 Source: finish and test\n4 Diagnostics\n'
+ ask 'Choose 1-4'
+ case "$ANSWER" in 1) MODE=source;; 2) MODE=target;; 3) MODE=finish;; 4) MODE=diagnose;; *) fail 'Invalid choice';; esac
+fi
+if [ "$MODE" = diagnose ]; then
+ id; ls -ld "$H"
+ if [ -d "$D" ]; then ls -ld "$D"; ls -l "$D/config" "$D/authorized_keys" 2>/dev/null || :; fi
+ ssh -V 2>&1 || :
+ if [ "$OS" = AIX ]; then lsuser -a home shell account_locked login rlogin expires "$U" || :
+ else getent passwd "$U"; command -v getenforce >/dev/null 2>&1 && getenforce || :; fi
+ printf '\nFor connection details: ssh -vvv remoteuser@target\nAdmin: inspect effective sshd -T -C settings for this connection, account/PAM restrictions and authentication logs.\n'
+ exit 0
+fi
+case "$MODE" in source|target|finish) :;; *) fail 'Unknown mode; use --help';; esac
+for TOOL in ssh ssh-keygen scp; do command -v "$TOOL" >/dev/null 2>&1 || fail "Missing $TOOL"; done
+PERM=$(ls -ld "$H" | awk '{print $1}')
+case "$PERM" in ?????w*|????????w*)
+ ask 'Home writable by group/others. Remove ONLY those write bits? [y/N]'
+ case "$ANSWER" in y|Y) chmod go-w "$H";; *) fail 'Home permissions need review';; esac;;
+esac
+[ ! -L "$D" ] || fail 'Symlink .ssh requires manual review'
+if [ ! -d "$D" ]; then mkdir "$D"; fi
+[ -O "$D" ] || fail '.ssh must be owned by the current user'
+chmod 700 "$D"
+mkdir "$D/sp_pair.lock" 2>/dev/null || fail 'Wizard lock exists; check for another run before removing .ssh/sp_pair.lock'
+LOCK="$D/sp_pair.lock"
+RUN="$D/sp_run_$(date +%Y%m%d%H%M%S)_$$"; mkdir "$RUN"
+public_input() {
+ ask "$1"; set -- $ANSWER
+ [ "$#" -ge 2 ] || fail 'Paste one complete PUBLIC key line'
+ KT=$1; KB=$2
+ case "$KT" in ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) :;; *) fail 'Unsupported public key type';; esac
+ case "$KB" in ''|*[!A-Za-z0-9+/=]*) fail 'Invalid public key';; esac
+ printf '%s %s\n' "$KT" "$KB" > "$RUN/public"
+ ssh-keygen -lf "$RUN/public" || fail 'Public key validation failed'
+}
+if [ "$MODE" = target ]; then
+ printf '\nStep 2: install the source USER public key.\n'
+ ask 'Authorized keys file [Enter = default .ssh/authorized_keys; custom path only if admin confirmed]'
+ A=${ANSWER:-$D/authorized_keys}; safe "$A"
+ case "$A" in /*) :;; *) fail 'Use an absolute path';; esac
+ filecheck "$A"
+ public_input 'Paste source user PUBLIC key'
+ if [ -f "$A" ] && awk -v b="$KB" '{for(i=1;i<=NF;i++) if($i==b) found=1} END {exit !found}' "$A"; then
+  printf 'Key already exists; existing restrictions and contents preserved.\n'
+ else
+  ask 'Optional source IP restriction (Enter = none; use actual IP seen by target)'
+  IP=$ANSWER; OPT='no-agent-forwarding,no-port-forwarding,no-X11-forwarding'
+  if [ -n "$IP" ]; then
+   case "$IP" in *[!0-9a-fA-F:.]*) fail 'Numeric IP required';; esac
+   OPT="from=\"$IP\",$OPT"
+  fi
+  if [ -f "$A" ]; then cp -p "$A" "$RUN/authorized_keys.before"; else : > "$A"; fi
+  chmod 600 "$A"
+  printf '\n%s %s %s sp-pair\n' "$OPT" "$KT" "$KB" >> "$A"
+  printf 'Key appended. Backup if previously present: %s/authorized_keys.before\n' "$RUN"
+ fi
+ printf '\nCOPY ONE TARGET HOST PUBLIC KEY BACK TO SOURCE (from trusted session):\n'
+ FOUND=no
+ for F in /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ecdsa_key.pub /etc/ssh/ssh_host_rsa_key.pub; do
+  if [ -r "$F" ]; then printf '\n%s\n' "$F"; cat "$F"; ssh-keygen -lf "$F"; FOUND=yes; fi
+ done
+ [ "$FOUND" = yes ] || printf 'Ask admin for the active sshd HOST PUBLIC key; no private key is needed.\n'
+ printf '\nFor custom sshd installations, confirm which host key is active.\nNow run finish on source, as the source user.\n'
+ exit 0
+fi
+ask 'Exact target hostname or IPv4 you will use in scp'; HOST=$(printf '%s' "$ANSWER" | tr '[:upper:]' '[:lower:]')
+case "$HOST" in ''|-*|*[!A-Za-z0-9._-]*) fail 'Use a DNS hostname or IPv4';; esac
+ask "Target user [$U]"; RU=${ANSWER:-$U}
+case "$RU" in ''|-*|*[!A-Za-z0-9_-]*) fail 'Invalid username';; esac
+ask 'SSH port [22]'; PORT=${ANSWER:-22}
+case "$PORT" in ''|*[!0-9]*) fail 'Invalid port';; esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fail 'Invalid port'
+PAIR="$D/sp_pair_${HOST}_${RU}_${PORT}"
+[ ! -L "$PAIR" ] || fail 'Pair directory is a symlink'
+if [ ! -d "$PAIR" ]; then mkdir "$PAIR"; fi
+[ -O "$PAIR" ] || fail 'Pair directory owner mismatch'; chmod 700 "$PAIR"
+KEY="$PAIR/id_rsa"; KH="$PAIR/known_hosts"
+filecheck "$KEY"; filecheck "$KEY.pub"; filecheck "$KH"
+if [ "$MODE" = source ]; then
+ if [ -e "$KEY" ] || [ -e "$KEY.pub" ]; then
+  [ -f "$KEY" ] && [ -f "$KEY.pub" ] || fail 'Incomplete key pair; inspect before proceeding'
+  printf 'Reusing existing dedicated key; not overwriting.\n'
+ else
+  printf '\nPassphrase: Enter twice = unattended key if permitted by your organization.\n'
+  ssh-keygen -t rsa -b 3072 -f "$KEY" -C "sp-pair-$U-$HOST"
+ fi
+ printf '\nCOPY THIS USER PUBLIC KEY TO TARGET:\n'; cat "$KEY.pub"; ssh-keygen -lf "$KEY.pub"
+ printf '\nPrivate key stays here: %s\nRun target on the other host, then finish here. Use the same host/user/port.\n' "$KEY"
+ exit 0
+fi
+[ -f "$KEY" ] && [ -f "$KEY.pub" ] || fail 'Run source with the same hostname/user/port first'
+public_input 'Paste target HOST PUBLIC key from trusted target session'
+ask 'Fingerprint above matches the key shown in target session? [y/N]'
+case "$ANSWER" in y|Y) :;; *) fail 'Host key not confirmed';; esac
+if [ "$PORT" = 22 ]; then LABEL=$HOST; else LABEL="[$HOST]:$PORT"; fi
+printf '%s %s %s\n' "$LABEL" "$KT" "$KB" > "$RUN/known_hosts.new"
+if [ -f "$KH" ]; then
+ cmp "$KH" "$RUN/known_hosts.new" >/dev/null 2>&1 || fail 'Pinned host key differs; investigate, do not blindly replace'
+else cp "$RUN/known_hosts.new" "$KH"; fi
+filecheck "$C"
+MARK="# SP-PAIR BEGIN $HOST"
+if [ -f "$C" ] && awk -v m="$MARK" '$0==m {found=1} END {exit !found}' "$C"; then
+ printf 'Host already managed. Retaining current config and testing it.\n'
+else
+ if [ -f "$C" ]; then
+  cp -p "$C" "$RUN/config.before"
+  cp -p "$C" "$RUN/config.new"
+ fi
+ cat > "$RUN/block" <<BLOCK
+$MARK
+Host $HOST
+    HostName $HOST
+    User $RU
+    Port $PORT
+    IdentityFile $KEY
+    IdentitiesOnly yes
+    UserKnownHostsFile $KH
+    StrictHostKeyChecking yes
+# SP-PAIR END $HOST
+Host *
+
+BLOCK
+ cat "$RUN/block" > "$RUN/config.new"
+ if [ -f "$C" ]; then cat "$C" >> "$RUN/config.new"; fi
+ chmod 600 "$RUN/config.new"
+ # Validate syntax/effective config before replacing. -G requires OpenSSH 6.8+.
+ ssh -G -F "$RUN/config.new" "$RU@$HOST" > "$RUN/effective.preview" || fail 'Config validation failed; existing config retained'
+ mv "$RUN/config.new" "$C"
+ printf 'Host-specific config installed. Backup if previously present: %s/config.before\n' "$RUN"
+fi
+ssh -G "$RU@$HOST" > "$RUN/effective" || fail 'Effective SSH config cannot be read'
+awk -v k="$KEY" -v h="$HOST" -v p="$PORT" -v kh="$KH" '
+ $1=="identityfile" && $2==k {i=1}
+ $1=="hostname" && $2==h {n=1}
+ $1=="port" && $2==p {q=1}
+ $1=="userknownhostsfile" && $2==kh {f=1}
+ END {exit !(i&&n&&q&&f)}' "$RUN/effective" || fail 'Existing settings conflict with this pair; review .ssh/config and rerun'
+printf '\nTesting public-key login using your normal configuration.\n'
+# Avoid proving only that an old multiplexed session or password works.
+ssh -o ControlMaster=no -o ControlPath=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o ConnectTimeout=15 "$RU@$HOST" 'id; hostname' || fail 'SSH failed. Use diagnose and ssh -vvv; account/sshd policy may require admin.'
+ask 'Existing writable target directory for ordinary SCP test (Enter = skip)'
+DEST=$ANSWER
+if [ -n "$DEST" ]; then
+ safe "$DEST"; case "$DEST" in /*) :;; *) fail 'Absolute directory required';; esac
+ PROBE="sp_probe_$(date +%Y%m%d%H%M%S)_$$"; REMOTE="$DEST/$PROBE"
+ ssh "$RU@$HOST" "umask 077; mkdir '$REMOTE'" || fail 'Cannot create target probe directory'
+ printf '%s\n' "$PROBE" > "$RUN/probe"
+ scp "$RUN/probe" "$RU@$HOST:$REMOTE/probe" || fail "SCP upload failed; probe may remain: $REMOTE"
+ scp "$RU@$HOST:$REMOTE/probe" "$RUN/returned" || fail "SCP download failed; probe remains: $REMOTE"
+ cmp "$RUN/probe" "$RUN/returned" || fail "Probe mismatch; inspect $REMOTE"
+ ssh "$RU@$HOST" "rm '$REMOTE/probe' && rmdir '$REMOTE'" || fail "Probe verified, but cleanup failed: $REMOTE"
+ printf 'Ordinary SCP upload/download verified; remote probe removed.\n'
+fi
+printf '\nREADY as %s, using EXACT target spelling %s:\n' "$U" "$HOST"
+printf 'scp /path/file %s@%s:/destination/\n' "$RU" "$HOST"
+printf 'scp %s@%s:/remote/file /local/directory/\n' "$RU" "$HOST"
+printf 'ssh %s@%s\n' "$RU" "$HOST"
+printf '\nPair directory: %s\nOther host spellings (IP/FQDN/short name) need their own setup.\n' "$PAIR"
