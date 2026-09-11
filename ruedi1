@@ -1,0 +1,14 @@
+Subject: RE: LAH Activities during DWH-PROD-P cutover
+
+Hi Ruedi,
+
+I'll leave the Db2 LAN-free backup details to Norbert.
+
+Just a quick update from my side: the first APAC SP server instance is now running on P3. The migration did not change the existing Storage Agent or SP client configuration. I'm using the existing local SP client for CMOD retrieves from the migrated SP server.
+
+We're planning to migrate two more instances next week and the final one by the end of the month.
+
+For now, the SP database backups are included in the P3 host's file-level backup. I'm also looking into sending them directly to HCP to reduce backup storage usage on your side, and I'll discuss the details with you once the approach is clearer.
+
+Kind regards,
+Chris
