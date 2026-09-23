@@ -1,0 +1,1391 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""IBM Storage Protect 8.1.25 / HCP evidence collector. Standard library only.
+
+Python 2.7 or Python 3.6+, Linux/AIX, client with -credentialsfile support.
+Inventory is read-only. Explicit audit runs SCANALL, which can change
+damage/orphan flags in the SP database. No deletion or repair commands exist.
+Benchmark mode delegates to benchmark_audits.py and cancels its own timed trials.
+
+Maintainer's reading guide
+-------------------------
+Start with main() near the end of this file to see the complete workflow:
+  1. Prompt once and read the instance configuration.
+  2. Capture all selected containers, then export pool/namespace inventories.
+  3. In audit mode, submit ONE pool-wide audit and collect its completion evidence.
+  4. Write the result, measured durations, raw evidence and integrity checksums.
+
+The helpers appear in dependency order: parsing -> client sessions -> inventory
+-> audit reconciliation -> reports -> command-line entry point. Admin owns the
+credentials and clients. AdminSession frames one response at a time. SQLite is
+a LOCAL evidence database, never a direct connection to the SP server database.
+All server SQL is submitted through dsmadmc; reports are calculated locally.
+
+Evidence rules to preserve when changing the code:
+  * Keep current connection settings separate from each container's actual URL.
+  * Missing/unrecognized output is unknown, not a measured zero or success.
+  * Do not retry an audit whose submission may have reached the server.
+  * A clean retained-pool audit is separate from an old-namespace reference check.
+See README.md for command semantics and the limits of this evidence.
+"""
+from __future__ import print_function, unicode_literals
+
+import argparse
+import csv
+import datetime as dt
+import decimal
+import fcntl
+import getpass
+import hashlib
+import io
+import json
+import os
+import re
+import resource
+import select
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+try:
+    from urllib.parse import urlsplit, urlunsplit
+except ImportError:
+    from urlparse import urlsplit, urlunsplit
+
+VERSION = "1.2.0"
+PY2 = sys.version_info[0] == 2
+TEXT = type(u"")
+D = decimal.Decimal
+UNKNOWN = "UNKNOWN"
+MSG = re.compile(r"^\s*(AN[RS]\d{4}[A-Z])\b")
+SAFE_POOL = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,29}$")
+STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T-](\d{2})[:.](\d{2})[:.](\d{2})")
+CLOCK = getattr(time, "monotonic", lambda: os.times()[4])
+# UTC timestamps identify events; this elapsed-time clock measures duration.
+# The Python 2 fallback is elapsed real time from os.times(), not CPU time.
+
+
+class ToolError(Exception):
+    pass
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def duration_hms(seconds):
+    seconds = int(round(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
+
+
+def measure(timings,label,function,*args):
+    """Time a workflow phase, retaining its observed duration even if it raises."""
+    began = CLOCK()
+    try:
+        return function(*args)
+    finally:
+        timings[label] = round(max(0.0,CLOCK()-began),6)
+
+
+def say(s):
+    print(s)
+    sys.stdout.flush()
+
+
+def read_text(path):
+    with io.open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def write_text(path, value):
+    with io.open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(TEXT(value))
+
+
+def write_json(path, value):
+    # Replace the complete document atomically so readers do not see half a JSON
+    # document. This is a local checkpoint, not a server transaction or fsync.
+    tmp = path + ".new"
+    write_text(tmp, json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.rename(tmp, path)
+
+
+def slug(s, limit=65):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("._")[:limit] or "unknown"
+
+
+def pool_arg(s):
+    if not SAFE_POOL.match(s):
+        raise ToolError("Use one exact pool name (1-30 letters/digits/underscore/dot/hyphen); no wildcards.")
+    return s
+
+
+def numeric(value):
+    """Parse the forced English numeric format without losing decimal precision.
+
+    Blank size fields remain None. Treating them as zero would understate usage
+    while hiding that the measurement was unavailable.
+    """
+    if value is None or not TEXT(value).strip():
+        return None
+    s = TEXT(value).strip()
+    if not re.match(r"^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$", s):
+        raise ToolError("Unrecognized numeric value: {!r}".format(s))
+    return D(s.replace(",", ""))
+
+
+def counter(value):
+    number = numeric(value)
+    if number is None or number != number.to_integral_value():
+        raise ToolError("Expected a nonnegative integer counter: {!r}".format(value))
+    return int(number)
+
+
+def fmt(value):
+    return "" if value is None else format(value, "f")
+
+
+def mib_to_tib(value):
+    return "" if value is None else format(value / D(1048576), ".6f")
+
+
+def url_key(value):
+    """Normalize scheme/host only; retain the case-sensitive path and port."""
+    value = value.strip()
+    if not value:
+        return UNKNOWN
+    p = urlsplit(value)
+    if p.scheme.lower() not in ("http", "https") or not p.netloc:
+        raise ToolError("Unrecognized Cloud URL: {!r}".format(value))
+    if p.username or p.password or p.query or p.fragment:
+        raise ToolError("Cloud URL with credentials/query/fragment is outside this tool's scope.")
+    return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"), "", ""))
+
+
+def bucket_from_container(name):
+    # IBM 8.1.25 S3 example: bucket/server-prefix/0000000050.dcf.
+    # Do NOT silently substitute the current connection's bucket.
+    if name.startswith("s3://"):
+        name = name[5:]
+    parts = name.split("/", 1)
+    if len(parts) != 2 or not parts[1] or not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", parts[0]):
+        return UNKNOWN
+    return parts[0]
+
+
+def details(path, first):
+    """Stream LIST output, joining long wrapped identifiers without truncation."""
+    current, last = None, None
+    with io.open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\r\n")
+            if MSG.match(line):
+                last = None
+                continue
+            m = re.match(r"^\s*([A-Za-z][A-Za-z0-9 .()/?'_%+-]*):[ \t]*(.*)$", line)
+            if m and " " not in m.group(1).strip() and m.group(1).strip() not in (
+                    first,"Container","State","Description","Access","Compressed","Encrypted","Collocate?","Identity"):
+                # A wrapped URL can start with host:port or HTTP://. It is a
+                # continuation, not an IBM field just because it has a colon.
+                m = None
+            if m:
+                key, value = m.group(1).strip(), m.group(2).strip()
+                # The first field starts a record. Yielding here keeps a large
+                # container listing out of memory; callers consume it once.
+                if key == first:
+                    if current is not None:
+                        yield current
+                    current = {}
+                if current is not None:
+                    if value or key not in current:
+                        current[key] = value
+                    last = key
+            elif line.strip() and current is not None and last:
+                joiner = "" if last in ("Container", "Cloud URL", "Bucket Name", "Connection Name") else " "
+                current[last] = current.get(last, "") + joiner + line.strip()
+    if current is not None:
+        yield current
+
+
+def csv_rows(path):
+    f = open(path, "rb") if PY2 else io.open(path, encoding="utf-8", newline="")
+    try:
+        for row in csv.reader(f):
+            if PY2:
+                row = [c.decode("utf-8") for c in row]
+            if not row or not any(c.strip() for c in row):
+                continue
+            if MSG.match(row[0]):
+                continue
+            if row[0].startswith(("SELECT ", "QUERY ", "AUDIT ")):
+                # -ALWAYSPROMPT can echo commands read from redirected stdin.
+                # Actual data columns used here cannot start with these tokens.
+                continue
+            yield [c.strip() for c in row]
+    finally:
+        f.close()
+
+
+def export_csv(path, headers, rows):
+    f = open(path, "wb") if PY2 else io.open(path, "w", encoding="utf-8", newline="")
+    try:
+        w = csv.writer(f, lineterminator="\n")
+        for row in [headers]:
+            w.writerow([TEXT(v).encode("utf-8") for v in row] if PY2 else row)
+        for row in rows:
+            cells = ["" if v is None else TEXT(v) for v in row]
+            # Formula-like user identifiers must not execute when opened in Excel.
+            cells = [("'" + c) if c.startswith(("=", "+", "-", "@")) else c for c in cells]
+            w.writerow([c.encode("utf-8") for c in cells] if PY2 else cells)
+    finally:
+        f.close()
+
+
+def command_diagnostics(path, rc, allow_empty=False, command=""):
+    """Evaluate IBM messages as well as the operating-system return code.
+
+    Persistent clients are still running, so rc is None for their commands.
+    ANR2034E is accepted only where the caller explicitly allows no matches;
+    a blank response without that message is not equivalent to no matches.
+    """
+    # QUERY PROCESS uses ANR0944E (rather than SQL's ANR2034E) for an empty
+    # result. Accept it only for that query, never as a general error exemption.
+    no_process_query = command.strip().upper() == "QUERY PROCESS"
+    errors, warnings, empty, highest = [], [], False, None
+    command_codes = []
+    with io.open(path, encoding="utf-8") as f:
+        for line in f:
+            m = MSG.match(line)
+            if not m:
+                continue
+            code = m.group(1)
+            if code == "ANR2034E" or (code == "ANR0944E" and no_process_query):
+                empty = True
+                if allow_empty:
+                    continue
+            if code[-1] in "EWD":
+                (warnings if code[-1] == "W" else errors).append(line.strip())
+            n = re.search(r"[Hh]ighest return code was\s+(\d+)", line)
+            if n:
+                highest = int(n.group(1))
+            if code == "ANS8001I":
+                n = re.search(r"\bReturn code\s+(\d+)\b", line, re.I)
+                if n:
+                    command_codes.append(int(n.group(1)))
+                else:
+                    errors.append(line.strip())
+    allowed = (0, 11) if allow_empty and empty and not errors else (0,)
+    ok = ((rc is None or rc in allowed) and (highest is None or highest in allowed)
+          and all(value in allowed for value in command_codes) and not errors)
+    return {"ok": ok, "return_code": rc, "highest_return_code": highest,
+            "explicit_no_match": empty, "errors": errors, "warnings": warnings,
+            "command_return_codes": command_codes}
+
+
+class AdminSession(object):
+    """A reusable administrative client with explicit, streamed response framing.
+
+    Two output formats require two clients. A prompt closes a response only;
+    it does not establish that an audit succeeded. Audit coverage is checked
+    separately against correlated server messages and damage counters.
+    """
+    PROMPT = re.compile(br"(?:^|[\r\n])(?:tsm|Protect|sp|isp)[ \t]*:[ \t]*([^>\r\n]+)>[ \t\r\n]*\Z", re.I)
+
+    def __init__(self, admin, tabular):
+        self.admin, self.server_name = admin, None
+        self.process = None
+        self.startup_seconds = 0.0
+        admin.client_process_starts += 1
+        self.identifier = admin.client_process_starts
+        label = "csv" if tabular else "list"
+        startup = os.path.join(admin.root,"raw/session_{:03d}_{}_startup.txt".format(self.identifier,label))
+        began = CLOCK()
+        options = {"close_fds":False} if PY2 else {"close_fds":True,"pass_fds":(admin.fd,)}
+        argv = admin.client_argv(tabular) + ["-alwaysprompt", "-newlineafterprompt"]
+        self.process = subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,env=admin.environment(),**options)
+        try:
+            self.receive(startup,admin.args.connect_timeout)
+            diag = command_diagnostics(startup,None)
+            if not diag["ok"]:
+                raise ToolError("Client startup failed; see " + startup)
+        except BaseException:
+            self.close(force=True)
+            raise
+        finally:
+            self.startup_seconds = max(0.0,CLOCK()-began)
+            admin.session_startups.append({"session_id":self.identifier,"format":label,
+                                           "elapsed_seconds":round(self.startup_seconds,6),
+                                           "output":os.path.relpath(startup,admin.root)})
+
+    def receive(self,path,timeout):
+        """Stream until the same server's final prompt, or fail as incomplete.
+
+        A read may split either a message or the prompt across chunks. Keep a
+        small trailing buffer for framing and write the bulk listing directly
+        to disk. Prompt recognition establishes response completion only.
+        """
+        pending = b""
+        began = last_notice = CLOCK()
+        with open(path,"wb") as out:
+            while True:
+                if timeout and CLOCK()-began > timeout:
+                    out.write(pending)
+                    raise ToolError("Client response timeout. Server-side operation outcome is UNKNOWN; inspect QUERY PROCESS.")
+                if CLOCK()-last_notice >= 60:
+                    say("Still waiting; elapsed {}; log: {}".format(duration_hms(CLOCK()-began),path))
+                    last_notice = CLOCK()
+                try:
+                    ready,unused,unused2 = select.select([self.process.stdout.fileno()],[],[],0.5)
+                except (OSError,select.error) as exc:
+                    if getattr(exc,"errno",None)==4:
+                        continue
+                    raise
+                if not ready:
+                    continue
+                chunk = os.read(self.process.stdout.fileno(),65536)
+                if not chunk:
+                    out.write(pending)
+                    raise ToolError("Client disconnected before the final response prompt. Outcome UNKNOWN; see " + path)
+                pending += chunk
+                match = self.PROMPT.search(pending)
+                if match:
+                    name = match.group(1).strip().decode("utf-8")
+                    if self.server_name is not None and name!=self.server_name:
+                        out.write(pending)
+                        raise ToolError("The administrative session changed server identity.")
+                    self.server_name = name
+                    out.write(pending[:match.start()])
+                    return
+                # Keep only the possible prompt tail; large listings stay on disk.
+                if len(pending)>16384:
+                    out.write(pending[:-8192])
+                    pending = pending[-8192:]
+                    out.flush()
+
+    def execute(self,command,path,timeout):
+        if "\n" in command or "\r" in command:
+            raise ToolError("An administrative command must occupy a single line.")
+        self.process.stdin.write((command+"\n").encode("utf-8"))
+        self.process.stdin.flush()
+        self.receive(path,timeout)
+
+    def close(self,force=False):
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            if not force:
+                try:
+                    self.process.stdin.write(b"QUIT\n")
+                    self.process.stdin.flush()
+                except (IOError,OSError):
+                    pass
+            else:
+                self.process.terminate()
+            for unused in range(20):
+                if self.process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if self.process.poll() is None:
+                self.process.kill()
+        self.process.wait()
+        self.process.stdin.close()
+        self.process.stdout.close()
+
+
+class Admin(object):
+    """Reuse LIST and CSV clients; offer explicit per-command batch compatibility.
+
+    Linux uses an unlinked file inherited via /proc. AIX uses a 0600 file in
+    a private directory, removed by close(). Both use -credentialsfile.
+    """
+    def __init__(self, args, root, username, password):
+        self.args, self.root, self.sequence = args, root, 0
+        self.journal = []
+        self.sessions = {}
+        self.session_startups = []
+        self.client_process_starts = 0
+        if any(c in username + password for c in "\r\n\x00"):
+            raise ToolError("ID/password must each occupy a single line.")
+        tmpdir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        # AIX does not provide Linux /proc/self/fd semantics. Use a private
+        # directory and a 0600 credentials file there, removed on normal exit
+        # and handled signals. SIGKILL/power loss can leave this file behind.
+        self.credential_directory = None
+        named = sys.platform.startswith("aix") or getattr(args,"credential_mode","auto")=="file"
+        if named:
+            self.credential_directory = tempfile.mkdtemp(prefix="sp_hcp_credentials_")
+            os.chmod(self.credential_directory,0o700)
+            self.credpath = os.path.join(self.credential_directory,"credentials")
+            fd = os.open(self.credpath,os.O_RDWR|os.O_CREAT|os.O_EXCL,0o600)
+            self.credentials = os.fdopen(fd,"w+b")
+        else:
+            self.credentials = tempfile.TemporaryFile(mode="w+b", dir=tmpdir)
+        self.credentials.write((username + "\n" + password + "\n").encode("utf-8"))
+        self.credentials.flush()
+        self.credentials.seek(0)
+        self.fd = self.credentials.fileno()
+        if not named:
+            self.credpath = "/proc/self/fd/{}".format(self.fd)
+        if not os.path.exists(self.credpath):
+            self.credentials.close()
+            raise ToolError("Anonymous credentials unavailable; use --credential-mode file.")
+        if PY2:
+            fcntl.fcntl(self.fd, fcntl.F_SETFD, fcntl.fcntl(self.fd, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC)
+
+    def close(self):
+        try:
+            for session in self.sessions.values():
+                session.close()
+        finally:
+            self.sessions.clear()
+            self.credentials.close()
+            if self.credential_directory:
+                os.unlink(self.credpath)
+                os.rmdir(self.credential_directory)
+
+    def close_csv_before_audit(self):
+        # A long WAIT=YES must not leave an unused CSV client exposed to the
+        # server's administrative idle timeout. Reconnect it after the audit.
+        session = self.sessions.pop(True,None)
+        if session:
+            session.close()
+
+    def environment(self):
+        env = os.environ.copy()
+        env.update({"LC_ALL":"C","LANG":"C"})
+        return env
+
+    def client_argv(self,tabular):
+        argv = [self.args.dsmadmc,"-credentialsfile="+self.credpath,
+                "-dateformat=1","-timeformat=1","-numberformat=1"]
+        if self.args.server:
+            argv.append("-se="+self.args.server)
+        if self.args.optfile:
+            argv.append("-optfile="+self.args.optfile)
+        if tabular:
+            argv += ["-commadelimited","-dataonly=yes","-displaymode=table"]
+        else:
+            argv += ["-displaymode=list"]
+        if self.args.mode in ("audit","benchmark"):
+            argv.append("-noconfirm")
+        return argv
+
+    def run(self, command, label, tabular=False, allow_empty=False, timeout=None, require=True):
+        """Submit once, preserve raw output and journal its observed outcome.
+
+        require=False returns command diagnostics for the audit reconciler;
+        it does not ignore a timeout, broken connection or framing failure.
+        """
+        if self.args.client_mode=="batch":
+            return self._run_batch(command,label,tabular,allow_empty,timeout,require)
+        self.sequence += 1
+        rel = "raw/{:03d}_{}.txt".format(self.sequence,slug(label))
+        path = os.path.join(self.root,rel)
+        entry = {"command":command,"output":rel,"status":"STARTING","client_mode":"persistent"}
+        self.journal.append(entry)
+        self.save_journal()
+        session = self.sessions.get(tabular)
+        try:
+            if session is not None and session.process.poll() is not None:
+                # Nothing has been submitted yet; opening a replacement cannot
+                # replay an audit. A mid-command disconnect is never replayed.
+                session.close()
+                self.sessions.pop(tabular,None)
+                session = None
+            if session is None:
+                session = AdminSession(self,tabular)
+                self.sessions[tabular] = session
+            entry.update({"status":"RUNNING","session_id":session.identifier,"started_utc":now()})
+            self.save_journal()
+            say("[{}] {}".format(entry["started_utc"],command))
+            began = CLOCK()
+            try:
+                session.execute(command,path,self.args.query_timeout if timeout is None else timeout)
+            finally:
+                entry["elapsed_seconds"] = round(max(0.0,CLOCK()-began),6)
+                entry["ended_utc"] = now()
+        except BaseException:
+            entry["status"] = "INTERRUPTED_OUTCOME_UNKNOWN"
+            if session is not None:
+                session.close(force=True)
+                self.sessions.pop(tabular,None)
+            self.save_journal()
+            raise
+        result = command_diagnostics(path,None,allow_empty,command)
+        result.update({"path":path,"relative_path":rel,"command":command,"response_complete":True,
+                       "elapsed_seconds":entry["elapsed_seconds"],"started_utc":entry["started_utc"],
+                       "ended_utc":entry["ended_utc"],"timing_basis":"command_send_to_final_prompt",
+                       "client_mode":"persistent"})
+        entry.update({"status":"FINISHED","diagnostics":result})
+        self.save_journal()
+        if require and not result["ok"]:
+            raise ToolError("Command reported an error; see " + path)
+        return result
+
+    def _run_batch(self, command, label, tabular=False, allow_empty=False, timeout=None, require=True):
+        self.sequence += 1
+        self.client_process_starts += 1
+        rel = "raw/{:03d}_{}.txt".format(self.sequence, slug(label))
+        path = os.path.join(self.root, rel)
+        argv = self.client_argv(tabular)
+        argv.append(command)
+        entry = {"command": command, "output": rel, "started_utc": now(), "status": "RUNNING"}
+        self.journal.append(entry)
+        self.save_journal()
+        say("[{}] {}".format(now(), command))
+        env = self.environment()
+        options = {"close_fds": False} if PY2 else {"close_fds": True, "pass_fds": (self.fd,)}
+        began, last_notice, process = CLOCK(), CLOCK(), None
+        timeout = self.args.query_timeout if timeout is None else timeout
+        try:
+            with open(path, "wb") as out, open(os.devnull, "rb") as inp:
+                process = subprocess.Popen(argv, stdin=inp, stdout=out, stderr=subprocess.STDOUT,
+                                           env=env, **options)
+                while process.poll() is None:
+                    if timeout and CLOCK() - began > timeout:
+                        raise ToolError("Client timeout. Server-side operation outcome is UNKNOWN; inspect QUERY PROCESS.")
+                    if CLOCK() - last_notice >= 60:
+                        say("Still waiting; elapsed {} s; log: {}".format(int(CLOCK()-began), path))
+                        last_notice = CLOCK()
+                    time.sleep(0.2)
+                rc = process.returncode
+        except BaseException:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                for unused in range(20):
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            entry.update({"status":"INTERRUPTED_OUTCOME_UNKNOWN","ended_utc":now(),
+                          "elapsed_seconds":round(max(0.0,CLOCK()-began),6)})
+            self.save_journal()
+            raise
+        result = command_diagnostics(path, rc, allow_empty, command)
+        result.update({"path":path,"relative_path":rel,"command":command,"response_complete":True,
+                       "elapsed_seconds":round(max(0.0,CLOCK()-began),6),"started_utc":entry["started_utc"],
+                       "ended_utc":now(),"timing_basis":"batch_client_wall_time_including_login",
+                       "client_mode":"batch"})
+        entry["elapsed_seconds"] = result["elapsed_seconds"]
+        entry.update({"status": "FINISHED", "ended_utc": now(), "diagnostics": result})
+        self.save_journal()
+        if require and not result["ok"]:
+            raise ToolError("Command failed (rc={}); see {}".format(rc, path))
+        return result
+
+    def save_journal(self):
+        write_json(os.path.join(self.root, "commands.json"), self.journal)
+
+    def write_profile(self):
+        data = {"client_mode":self.args.client_mode,"client_process_starts":self.client_process_starts,
+                "server_commands_submitted":sum(1 for e in self.journal if e.get("started_utc")),
+                "session_startups":self.session_startups,
+                "session_startup_seconds":round(sum(e["elapsed_seconds"] for e in self.session_startups),6)}
+        write_json(os.path.join(self.root,"client_profile.json"),data)
+        return data
+
+
+def scalar(admin, sql, label):
+    result = admin.run(sql, label, tabular=True)
+    rows = list(csv_rows(result["path"]))
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise ToolError("Expected one SQL value; see " + result["path"])
+    return rows[0][0]
+
+
+def server_clock(admin, label):
+    value = scalar(admin, "SELECT CURRENT_TIMESTAMP FROM STATUS", label)
+    m = STAMP.search(value)
+    if not m:
+        raise ToolError("Unrecognized server timestamp: " + value)
+    return dt.datetime(*[int(x) for x in m.groups()])
+
+
+def configuration(admin, label):
+    """Read all pool/connection definitions with three commands, regardless of size.
+
+    Keep unassigned connections too: an old namespace may still be configured
+    even when no selected cloud pool currently refers to that connection.
+    """
+    status = admin.run("QUERY STATUS", label + "_server")
+    server_match = re.search(r"^\s*Server Name:\s*(\S.*?)\s*$",read_text(status["path"]),re.M)
+    server_name = server_match.group(1) if server_match else UNKNOWN
+    say("SP server: " + server_name)
+    sp = admin.run("QUERY STGPOOL * FORMAT=DETAILED", label + "_pools")
+    cx = admin.run("QUERY CONNECTION FORMAT=DETAILED", label + "_connections", allow_empty=True)
+    all_pools = list(details(sp["path"], "Storage Pool Name"))
+    if not all_pools:
+        raise ToolError("No English storage-pool records parsed; see " + sp["path"])
+    connections = {}
+    for record in details(cx["path"], "Connection Name"):
+        key = record["Connection Name"].upper()
+        if key in connections:
+            raise ToolError("Duplicate connection name: " + key)
+        connections[key] = record
+    if not connections and not cx["explicit_no_match"]:
+        raise ToolError("Connection output was not recognized; no empty inventory will be claimed.")
+    pools = {}
+    for record in all_pools:
+        if "Storage Type" not in record:
+            raise ToolError("Missing Storage Type in QUERY STGPOOL record.")
+        if record["Storage Type"].upper() == "CLOUD":
+            name = pool_arg(record["Storage Pool Name"])
+            pools[name] = record
+    if not pools:
+        raise ToolError("No CLOUD storage pools found.")
+    return {"pools": pools, "connections": connections, "server_name":server_name,
+            "server_status_file": status["relative_path"],
+            "non_cloud_pools": [p["Storage Pool Name"] for p in all_pools if p.get("Storage Type", "").upper() != "CLOUD"]}
+
+
+def new_database(root):
+    """Create indexed local tables for streaming exports and audit joins.
+
+    Sizes stay as decimal text: SQLite REAL would introduce rounding into the
+    sums. The snapshot/pool/name key detects duplicate container records.
+    """
+    db = sqlite3.connect(os.path.join(root, "evidence.sqlite"))
+    db.row_factory = sqlite3.Row
+    db.execute("""CREATE TABLE containers (
+        snapshot TEXT, pool TEXT, name TEXT, kind TEXT, state TEXT,
+        cloud_type TEXT, bucket TEXT, cloud_url TEXT, target_key TEXT,
+        utilized_mb TEXT, object_mb TEXT, last_audit TEXT, last_written TEXT,
+        connection TEXT, configured_bucket TEXT, configured_url TEXT, note TEXT,
+        PRIMARY KEY(snapshot,pool,name))""")
+    db.execute("CREATE INDEX target_idx ON containers(snapshot,bucket,target_key,name)")
+    db.execute("""CREATE TABLE audit_endings (
+        pool TEXT, name TEXT PRIMARY KEY, process_id TEXT, inspected INTEGER,
+        damaged INTEGER, reset_undamaged INTEGER, orphaned INTEGER, source TEXT)""")
+    return db
+
+
+def bulk_container_counts(admin,pool_names,label):
+    # One aggregation per snapshot boundary, independent of the pool count.
+    where = " WHERE STGPOOL_NAME='{}'".format(pool_names[0]) if len(pool_names)==1 else ""
+    sql = "SELECT STGPOOL_NAME,COUNT(*) FROM CONTAINERS{} GROUP BY STGPOOL_NAME".format(where)
+    result = admin.run(sql,label,tabular=True,allow_empty=True)
+    counts = {}
+    for row in csv_rows(result["path"]):
+        if len(row)!=2 or row[0] in counts:
+            raise ToolError("Unrecognized/duplicate grouped count; see " + result["path"])
+        counts[row[0]] = counter(row[1])
+    if not counts and not result["explicit_no_match"]:
+        raise ToolError("Grouped count output is missing without an explicit no-match response.")
+    return counts
+
+
+def capture_snapshot(admin, db, root, tag, config, pool_names):
+    """Bracket one bulk listing with grouped counts, then export it locally.
+
+    Equal counts catch truncation and some concurrent changes, but cannot prove
+    transactional consistency: one object could replace another between reads.
+    The audit path additionally compares before/after identities and metadata.
+    """
+    info = {"tag":tag,"started_utc":now(),"pools":{},"issues":[],"scope":pool_names}
+    if config["server_name"]==UNKNOWN:
+        info["issues"].append("SERVER_NAME_NOT_PARSED")
+    mappings = {}
+    for pool in pool_names:
+        record = config["pools"][pool]
+        connection = record.get("Connection Name","")
+        conn = config["connections"].get(connection.upper(),{})
+        bucket,configured_url = conn.get("Bucket Name",""),conn.get("Cloud URL","")
+        if not conn or not bucket or not configured_url:
+            info["issues"].append(pool + ": INCOMPLETE_CURRENT_CONNECTION_MAPPING")
+        mappings[pool] = (connection,bucket,configured_url)
+        info["pools"][pool] = {"parsed":0,"cloud":0,"local_staging":0,"pending":0,
+                              "unresolved_target":0,"different_from_current_connection":0}
+    counts_before = bulk_container_counts(admin,pool_names,tag+"_counts_before")
+    selector = "STGPOOL="+pool_names[0] if len(pool_names)==1 else "*"
+    result = admin.run("QUERY CONTAINER {} TYPE=ANY FORMAT=DETAILED".format(selector),
+                       tag+"_containers_bulk",allow_empty=True)
+    canonical = dict((p.upper(),p) for p in pool_names)
+    known_other = set(p.upper() for p in config["non_cloud_pools"])
+    parsed_total = 0
+    for c in details(result["path"],"Container"):
+        observed = c.get("Storage Pool Name","").upper()
+        if not observed:
+            raise ToolError("Missing pool in container record.")
+        if observed not in canonical:
+            if selector!="*" or observed not in known_other:
+                raise ToolError("Unexpected pool during bulk container query: " + observed)
+            continue
+        pool = canonical[observed]
+        connection,bucket,configured_url = mappings[pool]
+        metrics = info["pools"][pool]
+        name,kind = c.get("Container",""),c.get("Container Type","")
+        if not name or not kind or "\n" in name or "\r" in name:
+            raise ToolError("Malformed container record.")
+        note,actual_bucket,actual_url,target = [],"","",""
+        if kind.upper()=="CLOUD":
+            # Historical containers can point at a different namespace/URL
+            # than today's connection. Group by the observed container target.
+            metrics["cloud"] += 1
+            actual_bucket = bucket_from_container(name)
+            actual_url = c.get("Cloud URL","")
+            target = url_key(actual_url)
+            if actual_bucket==UNKNOWN or target==UNKNOWN:
+                note.append("UNRESOLVED_CONTAINER_TARGET")
+                metrics["unresolved_target"] += 1
+            elif actual_bucket!=bucket or (configured_url and target!=url_key(configured_url)):
+                note.append("DIFFERS_FROM_CURRENT_CONNECTION")
+                metrics["different_from_current_connection"] += 1
+        elif kind.upper() in ("DEDUP","NON DEDUP","NON-DEDUP","NONDEDUP"):
+            # Cloud pools can also have local staging containers. Include them
+            # in pool coverage, but never count them as HCP objects.
+            metrics["local_staging"] += 1
+            note.append("LOCAL_STAGING_CONTAINER")
+        else:
+            raise ToolError("Unrecognized container type: " + kind)
+        state = c.get("State","")
+        if state.upper()=="PENDING":
+            metrics["pending"] += 1
+            note.append("PENDING_DELETION")
+        row = (tag,pool,name,kind,state,c.get("Cloud Type",""),actual_bucket,actual_url,target,
+               fmt(numeric(c.get("Space Utilized (MB)"))),fmt(numeric(c.get("Cloud Object Size (MB)"))),
+               c.get("Approx. Date Last Audit",""),c.get("Approx. Date Last Written",""),
+               connection,bucket,configured_url,";".join(note))
+        try:
+            db.execute("INSERT INTO containers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",row)
+        except sqlite3.IntegrityError:
+            raise ToolError("Duplicate/truncated container identifier: " + name)
+        metrics["parsed"] += 1
+        parsed_total += 1
+        if parsed_total % 10000==0:
+            db.commit()
+    db.commit()
+    counts_after = bulk_container_counts(admin,pool_names,tag+"_counts_after")
+    for pool in pool_names:
+        metrics = info["pools"][pool]
+        n_before,n_after = counts_before.get(pool,0),counts_after.get(pool,0)
+        stable = n_before==metrics["parsed"]==n_after
+        if not stable:
+            info["issues"].append(pool + ": COUNTS_CHANGED_OR_OUTPUT_INCOMPLETE")
+        if metrics["unresolved_target"]:
+            info["issues"].append(pool + ": UNRESOLVED_CONTAINER_TARGETS")
+        metrics.update({"count_before":n_before,"count_after":n_after,"counts_match":stable})
+    info["ended_utc"] = now()
+    folder = os.path.join(root,tag)
+    os.mkdir(folder)
+    export_snapshot(db,folder,tag,info,config)
+    write_json(os.path.join(folder,"snapshot.json"),info)
+    return info
+
+
+def export_snapshot(db, folder, tag, info, config):
+    """Produce detailed CSVs, usage totals and one list per observed HCP target.
+
+    Every SQL statement in this function runs against local SQLite. None starts
+    a dsmadmc client. Namespace sizes count each distinct container once; any
+    duplicate cross-pool references remain visible and require review.
+    """
+    columns = [r[1] for r in db.execute("PRAGMA table_info(containers)")]
+    export_csv(os.path.join(folder, "containers.csv"), columns,
+               db.execute("SELECT * FROM containers WHERE snapshot=? ORDER BY pool,name", (tag,)))
+    pool_rows = []
+    for pool in info["scope"]:
+        record = config["pools"][pool]
+        conn_name = record.get("Connection Name", "")
+        conn = config["connections"].get(conn_name.upper(), {})
+        metrics = info["pools"][pool]
+        allocated = numeric(record.get("Cloud Space Allocated (MB)"))
+        utilized = numeric(record.get("Cloud Space Utilized (MB)"))
+        known, missing = D(0), 0
+        for value in db.execute("SELECT utilized_mb FROM containers WHERE snapshot=? AND pool=? AND upper(kind)='CLOUD'", (tag,pool)):
+            number = numeric(value[0])
+            if number is None:
+                missing += 1
+            else:
+                known += number
+        pool_rows.append([pool, conn_name, conn.get("Cloud Type", ""), conn.get("Bucket Name", ""),
+                          conn.get("Cloud URL", ""), fmt(allocated), fmt(utilized), mib_to_tib(utilized),
+                          fmt(known), missing, metrics["parsed"], metrics["cloud"], metrics["local_staging"],
+                          metrics["pending"], metrics["different_from_current_connection"],
+                          metrics["unresolved_target"], metrics["counts_match"]])
+    export_csv(os.path.join(folder,"stgpools.csv"),
+               ["stgpool","current_connection","cloud_type","configured_namespace","configured_cloud_url",
+                "sp_cloud_allocated_MB","sp_cloud_utilized_MB","sp_cloud_utilized_TiB_assuming_binary_MB",
+                "container_utilized_MB_known_sum","containers_missing_size","containers_total","cloud_containers",
+                "local_staging_containers","pending_containers","containers_different_target",
+                "containers_unresolved_target","counts_match"], pool_rows)
+    export_csv(os.path.join(folder,"connections.csv"),
+               ["connection","cloud_type","namespace","cloud_url","configured_cloud_pools"],
+               ([name,c.get("Cloud Type",""),c.get("Bucket Name",""),c.get("Cloud URL",""),
+                 ";".join(sorted(p for p,r in config["pools"].items() if r.get("Connection Name","").upper()==name))]
+                for name,c in sorted(config["connections"].items())))
+    lists_dir = os.path.join(folder, "namespace_lists")
+    os.mkdir(lists_dir)
+    namespace_rows = []
+    targets = db.execute("SELECT DISTINCT bucket,target_key FROM containers WHERE snapshot=? AND upper(kind)='CLOUD' ORDER BY bucket,target_key", (tag,)).fetchall()
+    for target in targets:
+        bucket, key = target
+        digest = hashlib.sha256((bucket + "\n" + key).encode("utf-8")).hexdigest()[:12]
+        # URL punctuation is sanitized for filenames. The digest distinguishes
+        # targets whose readable sanitized filenames would otherwise collide.
+        filename = "{}__{}__{}.txt".format(slug(bucket), slug(key, 100), digest)
+        rows = db.execute("SELECT * FROM containers WHERE snapshot=? AND bucket=? AND target_key=? ORDER BY name,pool", (tag,bucket,key))
+        count, references, known_sum, object_sum, missing, object_missing, duplicates = 0,0,D(0),D(0),0,0,0
+        pools, urls, last_name = set(), set(), None
+        with io.open(os.path.join(lists_dir,filename), "w", encoding="utf-8") as out:
+            for c in rows:
+                references += 1
+                pools.add(c["pool"])
+                urls.add(c["cloud_url"])
+                if c["name"] == last_name:
+                    duplicates += 1
+                    continue
+                last_name = c["name"]
+                out.write(c["name"] + "\n")
+                count += 1
+                utilized, objsize = numeric(c["utilized_mb"]), numeric(c["object_mb"])
+                if utilized is None:
+                    missing += 1
+                else:
+                    known_sum += utilized
+                if objsize is None:
+                    object_missing += 1
+                else:
+                    object_sum += objsize
+        namespace_rows.append([bucket,key,";".join(sorted(urls)),";".join(sorted(pools)),count,references,
+                               fmt(known_sum),mib_to_tib(known_sum),missing,fmt(object_sum),object_missing,
+                               duplicates,"namespace_lists/"+filename])
+        if duplicates:
+            info["issues"].append("DUPLICATE_OBJECT_REFERENCES: " + bucket + " @ " + key)
+    export_csv(os.path.join(folder,"namespaces.csv"),
+               ["namespace_from_container","cloud_url_key","observed_cloud_urls","stgpools",
+                "unique_containers","database_references","sp_utilized_MB_known_sum",
+                "sp_utilized_TiB_assuming_binary_MB","containers_missing_utilized_size",
+                "cloud_object_MB_known_sum","containers_missing_object_size","duplicate_references","container_list"],
+               namespace_rows)
+    # Empty files for currently configured S3 targets with no container references.
+    # Listed in a separate index, never silently presented as proof of disuse.
+    configured_rows = []
+    for name,c in sorted(config["connections"].items()):
+        if c.get("Cloud Type", "").upper() != "S3" or not c.get("Cloud URL") or not c.get("Bucket Name"):
+            continue
+        bucket,key = c["Bucket Name"],url_key(c["Cloud URL"])
+        count = db.execute("SELECT COUNT(*) FROM containers WHERE snapshot=? AND bucket=? AND target_key=?",(tag,bucket,key)).fetchone()[0]
+        filename = "{}__{}__{}.txt".format(slug(bucket),slug(key,100),hashlib.sha256((bucket+"\n"+key).encode("utf-8")).hexdigest()[:12])
+        if not count:
+            write_text(os.path.join(lists_dir,filename), "")
+        configured_rows.append([name,bucket,c["Cloud URL"],count,"namespace_lists/"+filename,
+                                "CONFIGURATION_PRESENT; container count limited to snapshot scope"])
+    export_csv(os.path.join(folder,"configured_targets.csv"),
+               ["connection","namespace","cloud_url","container_references_in_scope","container_list","interpretation"],configured_rows)
+
+
+def audit_command(pool, maxprocess=4, validate="yes"):
+    # WAIT=YES lets the caller time the foreground command. MAXPROCESS controls
+    # server-side workers; it does not launch this many local client processes.
+    return "AUDIT CONTAINER STGPOOL={} ACTION=SCANALL VALIDATECLOUDEXTENTS={} MAXPROCESS={} WAIT=YES".format(pool_arg(pool),validate.upper(),maxprocess)
+
+
+def export_commands(root, config, maxprocess, validate):
+    folder = os.path.join(root,"audit_commands")
+    os.mkdir(folder)
+    lines = []
+    for pool in sorted(config["pools"]):
+        command = audit_command(pool,maxprocess,validate)
+        lines.append(command)
+        write_text(os.path.join(folder,slug(pool)+".mac"),
+                   "QUERY DAMAGED {} TYPE=STATUS\n{}\nQUERY DAMAGED {} TYPE=STATUS\n".format(pool,command,pool))
+    write_text(os.path.join(root,"audit_commands.txt"),"\n".join(lines)+"\n")
+
+
+def damaged(admin, pool, label):
+    """Read extent counters, not QUERY DAMAGED TYPE=INVENTORY file listings."""
+    result = admin.run("QUERY DAMAGED {} TYPE=STATUS".format(pool), label, tabular=True, allow_empty=True)
+    rows = list(csv_rows(result["path"]))
+    if not rows and result["explicit_no_match"]:
+        return {"non_dedup":0,"dedup":0,"orphaned":0,"source":result["relative_path"],"explicit_no_match":True}
+    if len(rows)!=1 or len(rows[0])!=4 or rows[0][0].upper()!=pool.upper():
+        raise ToolError("Unrecognized QUERY DAMAGED TYPE=STATUS output; see " + result["path"])
+    values = [None if not c else counter(c) for c in rows[0][1:]]
+    return dict(zip(["non_dedup","dedup","orphaned"], values),
+                source=result["relative_path"])
+
+
+def audit_messages_from_raw(path):
+    current = None
+    with io.open(path, encoding="utf-8") as f:
+        for line in f:
+            if MSG.match(line):
+                if current:
+                    yield current
+                current = line.strip()
+            elif current and line.strip():
+                current += " " + line.strip()
+    if current:
+        yield current
+
+
+def process_ids(messages):
+    # Only IDs emitted in our own command response establish correlation.
+    # Taking IDs from the entire activity log could mix unrelated audits in.
+    ids = set()
+    for message in messages:
+        if "AUDIT CONTAINER" in message.upper():
+            for m in re.finditer(r"\bprocess(?:\s+ID)?\s+(\d+)",message,re.I):
+                ids.add(m.group(1))
+    return ids
+
+
+ENDING = re.compile(
+    r"ANR4891I\s+AUDIT CONTAINER\s+process\s+(\d+)\s+ended for (?:the )?(.+?)\s+container:\s*"
+    r"([\d,]+)\s+data extents inspected,\s*([\d,]+)\s+data extents marked as damaged,\s*"
+    r"([\d,]+)\s+data extents previously marked as damaged reset to undamaged,\s*and\s*"
+    r"([\d,]+)\s+data extents marked as orphaned",re.I)
+
+
+def consume_audit_messages(db, pool, messages, ids, source):
+    """Accept an ending only when its process and initial container both match.
+
+    The same ending can occur in command output and ACTLOG. The primary key
+    prevents double counting. Findings are still examined on every occurrence.
+    """
+    findings, unmatched = [], 0
+    for message in messages:
+        message = re.sub(r"\s+"," ",message).strip()
+        pids = set(re.findall(r"\bprocess(?:\s+ID)?\s+(\d+)",message,re.I))
+        related = bool(ids & pids)
+        m = ENDING.search(message)
+        if m:
+            pid,name = m.group(1),m.group(2).strip().strip("\"'")
+            exists = db.execute("SELECT 1 FROM containers WHERE snapshot='before' AND pool=? AND name=?",(pool,name)).fetchone()
+            if related and exists:
+                nums = [int(n.replace(",","")) for n in m.groups()[2:]]
+                db.execute("INSERT OR IGNORE INTO audit_endings VALUES (?,?,?,?,?,?,?,?)",(pool,name,pid)+tuple(nums)+(source,))
+                if nums[1] or nums[3]:
+                    findings.append(message)
+            elif exists:
+                unmatched += 1
+        if related and re.search(r"\bAN[RS]\d{4}[EWD]\b",message):
+            findings.append(message)
+    db.commit()
+    return findings,unmatched
+
+
+def finish_audit(admin, db, root, pool, result, before, after, before_damage, after_damage,
+                 begin, end, config_changed, validate):
+    """Reconcile command status, per-container completion and final damage state.
+
+    This is the decision point for COMPLETED_CLEAN. Every unmet condition adds
+    a reportable reason; nothing below authorizes deletion of another target.
+    Counts/rates describe correlated evidence, not presumed work by MAXPROCESS.
+    """
+    # Use SERVER time, not the shell host's timezone, and retain full activity-log interval.
+    sql = ("SELECT DATE_TIME,MESSAGE FROM ACTLOG WHERE DATE_TIME>='{}' AND DATE_TIME<='{}' ORDER BY DATE_TIME".format(
+        begin.strftime("%Y-%m-%d %H:%M:%S"),(end+dt.timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")))
+    log = admin.run(sql,"audit_activity_log",tabular=True,allow_empty=True,require=False)
+    ids = process_ids(audit_messages_from_raw(result["path"]))
+    findings,unmatched = consume_audit_messages(db,pool,audit_messages_from_raw(result["path"]),ids,"audit_command_output")
+    if log["ok"]:
+        def messages():
+            for row in csv_rows(log["path"]):
+                if len(row)!=2:
+                    raise ToolError("Unrecognized ACTLOG SQL output; see " + log["path"])
+                yield row[1]
+        more, n = consume_audit_messages(db,pool,messages(),ids,"activity_log")
+        findings += more
+        unmatched += n
+    expected = before["pools"][pool]["parsed"]
+    completed = db.execute("SELECT COUNT(*) FROM audit_endings").fetchone()[0]
+    missing_sql = """SELECT c.pool,c.name,c.kind,c.state,c.bucket,c.cloud_url,c.last_audit
+        FROM containers c LEFT JOIN audit_endings a ON c.name=a.name AND c.pool=a.pool
+        WHERE c.snapshot='before' AND a.name IS NULL ORDER BY c.name"""
+    export_csv(os.path.join(root,"audit_containers_without_completion.csv"),
+               ["stgpool","container","type","state","namespace","cloud_url","last_audit_before"],db.execute(missing_sql))
+    export_csv(os.path.join(root,"audit_container_results.csv"),
+               ["stgpool","container","process_id","extents_inspected","extents_damaged","extents_reset_undamaged","extents_orphaned","source"],
+               db.execute("SELECT * FROM audit_endings ORDER BY name"))
+    changes = []
+    # A stable total alone can hide replacement of one container by another.
+    # Compare identities both ways and detect relevant metadata changes too.
+    for left,right,kind in [("before","after","DISAPPEARED"),("after","before","APPEARED")]:
+        query = """SELECT a.name FROM containers a LEFT JOIN containers b ON a.pool=b.pool AND a.name=b.name AND b.snapshot=?
+                   WHERE a.snapshot=? AND b.name IS NULL"""
+        changes.extend([[kind,r[0]] for r in db.execute(query,(right,left))])
+    for row in db.execute("""SELECT a.name FROM containers a JOIN containers b ON a.pool=b.pool AND a.name=b.name
+            WHERE a.snapshot='before' AND b.snapshot='after'
+            AND (a.bucket!=b.bucket OR a.cloud_url!=b.cloud_url OR a.kind!=b.kind OR a.last_written!=b.last_written)"""):
+        changes.append(["TARGET_TYPE_OR_LAST_WRITTEN_CHANGED",row[0]])
+    export_csv(os.path.join(root,"audit_inventory_changes.csv"),["change","container"],changes)
+    reasons = []
+    if not result["ok"]:
+        reasons.append("AUDIT_COMMAND_NONZERO_OR_ERROR")
+    if result["warnings"]:
+        reasons.append("AUDIT_COMMAND_WARNINGS")
+    if not log["ok"]:
+        reasons.append("ACTIVITY_LOG_UNAVAILABLE")
+    if not ids:
+        reasons.append("NO_PROCESS_IDS_IN_COMMAND_RESPONSE")
+    if completed != expected:
+        reasons.append("MISSING_CORRELATED_CONTAINER_COMPLETIONS")
+    if expected == 0:
+        reasons.append("NO_CONTAINERS_TO_VALIDATE")
+    if before["issues"] or after["issues"]:
+        reasons.append("INVENTORY_ISSUES")
+    if config_changed:
+        reasons.append("SERVER_OR_CONNECTION_CONFIGURATION_CHANGED_DURING_AUDIT")
+    if changes:
+        reasons.append("CONTAINER_SET_CHANGED_DURING_AUDIT")
+    if any(after_damage.get(k) is None for k in ("non_dedup","dedup","orphaned")):
+        reasons.append("UNKNOWN_DAMAGE_COUNTER")
+    if any(after_damage.get(k) for k in ("non_dedup","dedup","orphaned")):
+        reasons.append("DAMAGED_OR_ORPHANED_EXTENTS")
+    if findings:
+        reasons.append("AUDIT_FINDINGS")
+    if validate != "yes":
+        reasons.append("INDIVIDUAL_CLOUD_EXTENTS_NOT_VALIDATED")
+    summary = {"status":"COMPLETED_CLEAN" if not reasons else "REVIEW_REQUIRED",
+               "pool":pool,"command":result["command"],"reasons":reasons,
+               "server_time_begin":TEXT(begin),"server_time_end":TEXT(end),
+               "process_ids":sorted(ids),"containers_before":expected,"correlated_container_completions":completed,
+               "containers_after":after["pools"][pool]["parsed"],"inventory_changes":len(changes),
+               "before_damage":before_damage,"after_damage":after_damage,"unmatched_log_endings":unmatched,
+               "findings":sorted(set(findings)),"audit_client_return_code":result["return_code"],
+               "namespace_deletion_assessed":False,
+               "meaning":"Audit result for this pool and this interval only; no claim that an old namespace is disposable."}
+    signature = hashlib.sha256()
+    # This is an inventory fingerprint for comparing separate performance runs,
+    # not a checksum of HCP payloads and not proof of identical server workload.
+    for row in db.execute("""SELECT pool,name,kind,cloud_url,utilized_mb,last_written FROM containers
+                              WHERE snapshot='before' ORDER BY pool,name"""):
+        signature.update((json.dumps(list(row),ensure_ascii=True)+"\n").encode("utf-8"))
+    totals = db.execute("SELECT COALESCE(SUM(inspected),0),COALESCE(SUM(damaged),0),COALESCE(SUM(orphaned),0) FROM audit_endings").fetchone()
+    elapsed = result["elapsed_seconds"]
+    summary.update({"server_name":json.loads(read_text(os.path.join(root,"configuration.json")))["server_name"],
+                    "configured_maxprocess":admin.args.maxprocess,"validate_cloud_extents":validate,
+                    "audit_started_utc":result["started_utc"],"audit_ended_utc":result["ended_utc"],
+                    "audit_elapsed_seconds":elapsed,"audit_duration_hms":duration_hms(elapsed),
+                    "audit_timing_basis":result["timing_basis"],"client_mode":result["client_mode"],
+                    "completed_containers_per_minute":round(completed*60.0/elapsed,3) if elapsed>0 else None,
+                    "extents_inspected":totals[0],"extents_marked_damaged":totals[1],
+                    "extents_marked_orphaned":totals[2],
+                    "inspected_extents_per_second":round(totals[0]/elapsed,3) if elapsed>0 else None,
+                    "scope_signature_sha256":signature.hexdigest(),
+                    "server_observation_window_seconds":(end-begin).total_seconds()})
+    write_json(os.path.join(root,"audit_result.json"),summary)
+    return summary
+
+
+def candidate_report(db, root, filename, tag, config, snapshot):
+    """Check proposed old targets against this full-instance inventory.
+
+    A same-bucket match on another URL might be an endpoint alias. Keep that
+    case inconclusive instead of declaring the proposed target unreferenced.
+    HCP contents and other consumers are outside this SP-only observation.
+    """
+    rows = list(csv_rows(filename))
+    if not rows or rows[0] != ["namespace","cloud_url"]:
+        raise ToolError("Candidates CSV must have exactly this header: namespace,cloud_url")
+    output = []
+    for row in rows[1:]:
+        if len(row)!=2 or not all(row):
+            raise ToolError("Each candidate needs namespace and full cloud_url.")
+        bucket,url = row
+        key = url_key(url)
+        n = db.execute("SELECT COUNT(*) FROM containers WHERE snapshot=? AND bucket=? AND target_key=?",(tag,bucket,key)).fetchone()[0]
+        same_bucket = db.execute("SELECT COUNT(*) FROM containers WHERE snapshot=? AND bucket=?",(tag,bucket)).fetchone()[0]
+        conns = [name for name,c in config["connections"].items() if c.get("Bucket Name")==bucket and c.get("Cloud URL") and url_key(c["Cloud URL"])==key]
+        same_bucket_conns = [name for name,c in config["connections"].items() if c.get("Bucket Name")==bucket]
+        if n or conns:
+            outcome = "REFERENCE_OR_CONFIGURATION_PRESENT"
+        elif snapshot["issues"] or same_bucket or same_bucket_conns:
+            outcome = "INCONCLUSIVE_REVIEW_MAPPING_OR_URL_ALIASES"
+        else:
+            outcome = "NO_REFERENCE_FOUND_IN_THIS_INSTANCE_SCOPE"
+        output.append([bucket,url,n,same_bucket,";".join(conns),";".join(same_bucket_conns),outcome,"NOT_DETERMINED"])
+    export_csv(os.path.join(root,"candidate_namespaces.csv"),
+               ["namespace","cloud_url","exact_container_references","same_bucket_all_urls_references",
+                "exact_connections","same_bucket_all_connections","observation","deletion_assessment"],output)
+
+
+def report_text(root, mode, snapshot, audit=None, timings=None, profile=None):
+    initial_config = json.loads(read_text(os.path.join(root,"configuration.json")))
+    lines = ["IBM STORAGE PROTECT / HCP EVIDENCE REPORT", "Tool version: " + VERSION,
+             "Generated UTC: " + now(), "Server: " + initial_config["server_name"],
+             "Server details: " + initial_config["server_status_file"],
+             "Mode: " + mode, "Scope: " + ", ".join(snapshot["scope"]), ""]
+    if audit:
+        lines += ["AUDIT RESULT: " + audit["status"], "Command: " + audit["command"],
+                  "Configured MAXPROCESS: {}".format(audit["configured_maxprocess"]),
+                  "Audit started UTC: " + audit["audit_started_utc"],
+                  "Audit ended UTC: " + audit["audit_ended_utc"],
+                  "Audit duration: {} ({:.3f} seconds)".format(audit["audit_duration_hms"],audit["audit_elapsed_seconds"]),
+                  "Timing basis: " + audit["audit_timing_basis"],
+                  "Completed containers per minute: {}".format(audit["completed_containers_per_minute"]),
+                  "Inspected extents per second: {}".format(audit["inspected_extents_per_second"]),
+                  "Containers before / correlated completions / after: {} / {} / {}".format(
+                      audit["containers_before"],audit["correlated_container_completions"],audit["containers_after"]),
+                  "Extents inspected / marked damaged / marked orphaned: {} / {} / {}".format(
+                      audit["extents_inspected"],audit["extents_marked_damaged"],audit["extents_marked_orphaned"]),
+                  "Reasons: " + (", ".join(audit["reasons"]) or "none"),
+                  "Damage counters after: " + json.dumps(audit["after_damage"],sort_keys=True), ""]
+    if profile:
+        lines += ["DSMADMC mode: " + profile["client_mode"],
+                  "Client process starts: {}".format(profile["client_process_starts"]),
+                  "Server commands submitted: {}".format(profile["server_commands_submitted"]),""]
+    if timings:
+        lines.append("PHASE DURATIONS (excluding the final checksum pass)")
+        for key,value in sorted(timings.items()):
+            lines.append("{}: {} ({:.3f} seconds)".format(key,duration_hms(value),value))
+        lines.append("")
+    lines += ["INVENTORY: " + ("REVIEW_REQUIRED" if snapshot["issues"] else "COLLECTED; COUNTS_MATCH"),
+              "Count checks detect incomplete/changing output; they are not a transactionally consistent snapshot."]
+    for pool,values in sorted(snapshot["pools"].items()):
+        lines.append("{}: total={}, cloud={}, local={}, pending={}, different target={}, unresolved={}".format(
+            pool,values["parsed"],values["cloud"],values["local_staging"],values["pending"],
+            values["different_from_current_connection"],values["unresolved_target"]))
+    candidates = os.path.join(root,"candidate_namespaces.csv")
+    if os.path.isfile(candidates):
+        lines += ["", "CANDIDATE NAMESPACE REFERENCE CHECK (this instance only)"]
+        for row in list(csv_rows(candidates))[1:]:
+            lines.append("{} @ {}: exact references={}, exact connections={}; {}".format(
+                row[0],row[1],row[2],row[4] or "none",row[6]))
+    lines += ["", "Inventory issues: " + ("; ".join(snapshot["issues"]) or "none"), "",
+              "Read {}/stgpools.csv and {}/namespaces.csv for usage.".format(snapshot["tag"],snapshot["tag"]),
+              "Container lists use observed container bucket + Cloud URL, not only current connections.",
+              "Usage is SP-reported, possibly rounded MB. Known sums exclude blank/unknown sizes.",
+              "TiB columns assume IBM's displayed MB is binary; retain original MB for reconciliation.",
+              "This is NOT the physical/billable HCP usage or an HCP bucket/object listing.",
+              "", "NAMESPACE DELETION: NOT DETERMINED BY THIS REPORT",
+              "Evidence covers the selected instance only. Check source/target and DR instances,",
+              "DB backups and other applications; reconcile the actual HCP namespace/tenant endpoints.",
+              "An audit of retained pools does not establish migration completeness.",
+              "Use migration reconciliation and an application-level CMOD/SP retrieval test as separate evidence.",
+              "No rename, delete, repair, REMOVEDAMAGED, MARKDAMAGED or FORCEORPHANDBDEL is executed.",
+              "SCANALL can mark/reset damage and mark orphaned extents in the SP database."]
+    write_text(os.path.join(root,"REPORT.txt"),"\n".join(lines)+"\n")
+
+
+def manifest(root):
+    """Hash the completed evidence files after closing/flushing their writers.
+
+    These checksums detect later edits. They do not certify when collection
+    happened or establish the correctness of the underlying server response.
+    """
+    entries = []
+    for folder,dirs,files in os.walk(root):
+        dirs.sort()
+        for filename in sorted(files):
+            if filename == "SHA256SUMS.txt":
+                continue
+            path = os.path.join(folder,filename)
+            h = hashlib.sha256()
+            with open(path,"rb") as f:
+                for chunk in iter(lambda:f.read(1048576),b""):
+                    h.update(chunk)
+            entries.append(h.hexdigest()+"  "+os.path.relpath(path,root))
+    write_text(os.path.join(root,"SHA256SUMS.txt"),"\n".join(entries)+"\n")
+
+
+def executable(value):
+    if os.path.dirname(value):
+        if os.path.isfile(value) and os.access(value,os.X_OK):
+            return os.path.abspath(value)
+    else:
+        for folder in os.environ.get("PATH","").split(os.pathsep):
+            path = os.path.join(folder,value)
+            if os.path.isfile(path) and os.access(path,os.X_OK):
+                return os.path.abspath(path)
+    for default in ("/opt/tivoli/tsm/client/ba/bin/dsmadmc","/usr/tivoli/tsm/client/ba/bin64/dsmadmc"):
+        if value == "dsmadmc" and os.path.isfile(default) and os.access(default,os.X_OK):
+            return default
+    raise ToolError("dsmadmc not found; use --dsmadmc /full/path/dsmadmc")
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("mode",nargs="?",default="inventory",choices=["inventory","audit","benchmark"])
+    p.add_argument("pool",nargs="?",help="One exact pool for audit")
+    p.add_argument("--client-mode",choices=["persistent","batch"],default="persistent",
+                   help="Reuse LIST/CSV sessions (default), or explicit per-command batch compatibility")
+    p.add_argument("--connect-timeout",type=int,default=60,help="Seconds waiting for the initial client prompt")
+    p.add_argument("--dsmadmc",default="dsmadmc")
+    p.add_argument("--credential-mode",choices=["auto","file"],default="auto",help="Auto: anonymous on Linux, private 0600 file on AIX")
+    p.add_argument("--minutes",type=float,default=10,help="Benchmark duration per trial; default 10 minutes")
+    p.add_argument("--processes",default="10,20,40",help="Benchmark process limits in execution order; 1-99, comma-separated")
+    p.add_argument("--poll-seconds",type=float,default=30,help="Benchmark progress query interval; default 30 seconds")
+    p.add_argument("--settle-seconds",type=float,default=300,help="Maximum wait for audits to stop after cancellation")
+    p.add_argument("--cooldown-seconds",type=float,default=30,help="Pause between benchmark trials")
+    p.add_argument("--tolerance-percent",type=float,default=5,help="Choose smallest tested limit within this percent of fastest estimated duration")
+    p.add_argument("--min-containers",type=int,default=100,help="Minimum completed containers for an eligible benchmark sample")
+    p.add_argument("--server",help="Optional dsm.sys stanza; default uses existing client configuration")
+    p.add_argument("--optfile",help="Optional existing dsm.opt path")
+    p.add_argument("--out",help="New output directory; an existing path is never overwritten")
+    p.add_argument("--maxprocess",type=int,default=4,help="Full audit/generated commands: 1-99, default 4; benchmark uses --processes")
+    p.add_argument("--validate-cloud-extents",choices=["yes","no"],default="yes")
+    p.add_argument("--query-timeout",type=int,default=3600,help="Seconds per query; 0 means unlimited")
+    p.add_argument("--audit-timeout",type=int,default=0,help="Seconds waiting for audit; 0 means unlimited")
+    p.add_argument("--candidates",help="Optional CSV namespace,cloud_url; inventory mode only")
+    p.add_argument("--version",action="version",version=VERSION)
+    return p
+
+
+def main(argv=None):
+    """Orchestrate collection; preserve incomplete evidence on any failure."""
+    args = parser().parse_args(argv)
+    if args.mode=="benchmark":
+        import benchmark_audits
+        return benchmark_audits.run(args)
+    is_audit = args.mode=="audit"
+    if is_audit != bool(args.pool):
+        raise ToolError("Audit requires one pool; inventory takes no pool argument.")
+    if args.candidates and is_audit:
+        raise ToolError("Use --candidates with full-instance inventory.")
+    if not 1 <= args.maxprocess <= 99 or min(args.query_timeout,args.audit_timeout)<0 or args.connect_timeout<1:
+        raise ToolError("Invalid process count or timeout.")
+    if args.pool:
+        pool_arg(args.pool)
+    args.dsmadmc = executable(args.dsmadmc)
+    os.umask(0o077)
+    resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+    # No passwords are accepted as CLI arguments or environment variables.
+    if not sys.stdin.isatty():
+        raise ToolError("Run from a terminal: this tool prompts only for the dsmadmc ID and password.")
+    username = (raw_input("dsmadmc login: ") if PY2 else input("dsmadmc login: ")).strip()
+    password = getpass.getpass("dsmadmc password: ")
+    if not username or not password:
+        raise ToolError("ID and password cannot be empty.")
+    root = os.path.abspath(args.out or "sp_hcp_{}_{}_{}".format(
+        "audit" if is_audit else "inventory",time.strftime("%Y%m%dT%H%M%SZ",time.gmtime()),os.getpid()))
+    os.mkdir(root,0o700)
+    os.mkdir(os.path.join(root,"raw"),0o700)
+    run = {"tool_version":VERSION,"mode":args.mode,"started_utc":now(),"host":socket.gethostname(),
+           "status":"COLLECTING","pool":args.pool,"server_stanza":args.server,
+           "dsmadmc":args.dsmadmc,"namespace_deletion_assessed":False,
+           "configured_maxprocess":args.maxprocess,"client_mode":args.client_mode}
+    write_json(os.path.join(root,"run.json"),run)
+    admin,db = None,None
+    workflow_start,timings = CLOCK(),{}
+    try:
+        admin = Admin(args,root,username,password)
+        password = None
+        db = new_database(root)
+        config = measure(timings,"initial_configuration",configuration,admin,"initial")
+        write_json(os.path.join(root,"configuration.json"),config)
+        pools = sorted(config["pools"])
+        if is_audit:
+            matches = [p for p in pools if p.upper()==args.pool.upper()]
+            if len(matches)!=1:
+                raise ToolError("Requested pool is not a configured CLOUD storage pool.")
+            pools = matches
+        export_commands(root,config,args.maxprocess,args.validate_cloud_extents)
+        before = measure(timings,"inventory_before",capture_snapshot,admin,db,root,"before",config,pools)
+        summary = None
+        snapshot = before
+        if is_audit:
+            # Establish a baseline before submitting the one state-changing
+            # command. The explicit audit CLI mode is the operator's selection.
+            precheck_started = CLOCK()
+            pool = pools[0]
+            conn = config["connections"].get(config["pools"][pool].get("Connection Name","").upper(),{})
+            if conn.get("Cloud Type","").upper()!="S3":
+                raise ToolError("Audit mode in this HCP tool requires a resolved S3 connection.")
+            active = admin.run("QUERY PROCESS","processes_before",allow_empty=True)
+            if re.search(r"audit\s+container",read_text(active["path"]),re.I):
+                raise ToolError("An AUDIT CONTAINER process is already active. Finish/review it before this evidence run.")
+            pre_damage = damaged(admin,pool,"damage_before")
+            begin = server_clock(admin,"server_time_before_audit")
+            admin.close_csv_before_audit()
+            timings["pre_audit_checks"] = round(CLOCK()-precheck_started,6)
+            command = audit_command(pool,args.maxprocess,args.validate_cloud_extents)
+            run.update({"status":"AUDIT_RUNNING_OUTCOME_UNKNOWN","audit_command":command,"server_audit_start":TEXT(begin)})
+            write_json(os.path.join(root,"run.json"),run)
+            say("SCANALL may change damage/orphan flags in the SP database. No data removal command is used.")
+            result = admin.run(command,"audit_wait_yes",timeout=args.audit_timeout,require=False)
+            timings["audit"] = result["elapsed_seconds"]
+            say("Audit command finished in {} with MAXPROCESS={}. Collecting completion evidence.".format(
+                duration_hms(result["elapsed_seconds"]),args.maxprocess))
+            post_started = CLOCK()
+            # Collect final evidence even if the audit command reported errors;
+            # its diagnostic result is evaluated together with these findings.
+            end = server_clock(admin,"server_time_after_audit")
+            post_damage = damaged(admin,pool,"damage_after")
+            config_after = configuration(admin,"final")
+            write_json(os.path.join(root,"configuration_after.json"),config_after)
+            if pool not in config_after["pools"]:
+                raise ToolError("Audited pool disappeared during the run.")
+            after = capture_snapshot(admin,db,root,"after",config_after,pools)
+            timings["post_audit_collection"] = round(CLOCK()-post_started,6)
+            before_conn = config["pools"][pool].get("Connection Name","")
+            after_conn = config_after["pools"][pool].get("Connection Name","")
+            changed = (before_conn != after_conn or conn != config_after["connections"].get(after_conn.upper(),{})
+                       or config["server_name"] != config_after["server_name"])
+            summary = measure(timings,"audit_evidence_analysis",finish_audit,admin,db,root,pool,result,
+                              before,after,pre_damage,post_damage,begin,end,changed,args.validate_cloud_extents)
+            snapshot = after
+            run["status"] = summary["status"]
+        else:
+            if args.candidates:
+                candidate_report(db,root,args.candidates,"before",config,before)
+            run["status"] = "INVENTORY_REVIEW_REQUIRED" if before["issues"] else "INVENTORY_COLLECTED"
+        profile = admin.write_profile()
+        timings["workflow_to_report"] = round(CLOCK()-workflow_start,6)
+        export_csv(os.path.join(root,"timings.csv"),["phase","elapsed_seconds","duration_hms"],
+                   ([k,v,duration_hms(v)] for k,v in sorted(timings.items())))
+        if summary:
+            summary["phase_timings_seconds"] = timings
+            summary["client_profile"] = profile
+            write_json(os.path.join(root,"audit_result.json"),summary)
+            fields = ["server_name","pool","configured_maxprocess","status","validate_cloud_extents",
+                      "audit_started_utc","audit_ended_utc","audit_elapsed_seconds","audit_duration_hms",
+                      "containers_before","correlated_container_completions","completed_containers_per_minute",
+                      "extents_inspected","inspected_extents_per_second","client_mode","audit_timing_basis",
+                      "scope_signature_sha256"]
+            export_csv(os.path.join(root,"audit_performance.csv"),fields,[[summary.get(k) for k in fields]])
+        report_text(root,args.mode,snapshot,summary,timings,profile)
+        run["ended_utc"] = now()
+        write_json(os.path.join(root,"run.json"),run)
+        say("Result: {}\nReport: {}".format(run["status"],os.path.join(root,"REPORT.txt")))
+        return 2 if "REVIEW_REQUIRED" in run["status"] else 0
+    except BaseException as exc:
+        # A disconnected client cannot tell us whether server work has stopped.
+        # Retain logs and elapsed observations; never convert them into success
+        # and never automatically resubmit or cancel the server-side audit.
+        run.update({"status":"INCOMPLETE_OUTCOME_UNKNOWN","ended_utc":now(),"error":TEXT(exc) or type(exc).__name__})
+        observed = ""
+        if admin:
+            submitted = [e for e in admin.journal if e["command"].startswith("AUDIT CONTAINER ") and e.get("started_utc")]
+            if submitted and submitted[-1].get("elapsed_seconds") is not None:
+                seconds = submitted[-1]["elapsed_seconds"]
+                run["audit_elapsed_seconds_observed"] = seconds
+                observed = "Observed audit client duration: {} ({:.3f} seconds); MAXPROCESS={}. Completion is not established.\n".format(duration_hms(seconds),seconds,args.maxprocess)
+        run["phase_timings_seconds"] = timings
+        run["workflow_elapsed_seconds_observed"] = round(CLOCK()-workflow_start,6)
+        write_json(os.path.join(root,"run.json"),run)
+        write_text(os.path.join(root,"REPORT.txt"),
+                   "INCOMPLETE / OUTCOME UNKNOWN\n{}\n{}No success or deletion conclusion.\nIf AUDIT was submitted, check QUERY PROCESS and ACTLOG before starting it again.\n".format(run["error"],observed))
+        say("Incomplete run retained at: " + root)
+        raise
+    finally:
+        if db:
+            db.close()
+        if admin:
+            admin.close()
+            admin.write_profile()
+        manifest(root)
+
+
+if __name__ == "__main__":
+    def interrupted(signum,frame):
+        raise KeyboardInterrupt("Signal {}".format(signum))
+    signal.signal(signal.SIGTERM,interrupted)
+    signal.signal(signal.SIGHUP,interrupted)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say("Interrupted. A server-side audit may still be running; inspect QUERY PROCESS / ACTLOG.")
+        sys.exit(130)
+    except (ToolError,OSError,ValueError,decimal.InvalidOperation) as error:
+        say("ERROR: " + TEXT(error))
+        sys.exit(3)
